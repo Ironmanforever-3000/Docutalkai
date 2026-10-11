@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'motion/react';
 import { Menu, X } from 'lucide-react';
 import Logo from '../components/Logo';
@@ -16,10 +17,12 @@ const NAV_LINKS = [
 ];
 
 interface LandingPageProps {
-  onGetStarted: () => void;
+  onGetStarted?: () => void;
 }
 
 export default function LandingPage({ onGetStarted }: LandingPageProps) {
+  const navigate = useNavigate();
+  const handleGetStarted = onGetStarted || (() => navigate('/login'));
   const [scrolled, setScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [activeSection, setActiveSection] = useState('');
@@ -117,14 +120,14 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
           <div className="hidden md:flex items-center gap-3">
             <button
               id="nav-signin"
-              onClick={onGetStarted}
+              onClick={handleGetStarted}
               className="font-sans text-sm text-ash hover:text-parchment transition-colors focus-ember px-3 py-2 rounded-lg"
             >
               Sign in
             </button>
             <button
               id="nav-cta"
-              onClick={onGetStarted}
+              onClick={handleGetStarted}
               className="font-sans text-sm font-medium bg-ember-500 hover:bg-ember-600 text-ink-950 px-4 py-2 rounded-lg transition-colors focus-ember"
             >
               Get started
@@ -166,7 +169,7 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
                 ))}
                 <button
                   id="nav-mobile-cta"
-                  onClick={() => { setMobileMenuOpen(false); onGetStarted(); }}
+                  onClick={() => { setMobileMenuOpen(false); handleGetStarted(); }}
                   className="mt-2 w-full bg-ember-500 hover:bg-ember-600 text-ink-950 font-sans font-medium text-sm py-3 rounded-xl transition-colors focus-ember"
                 >
                   Get started free
@@ -179,11 +182,11 @@ export default function LandingPage({ onGetStarted }: LandingPageProps) {
 
       {/* ── Page sections ─────────────────────────────────────────── */}
       <main id="main-content">
-        <HeroSection onGetStarted={onGetStarted} />
+        <HeroSection onGetStarted={handleGetStarted} />
         <ProblemSolutionSection />
         <FeaturesSection />
         <DemoSection />
-        <PricingSection onGetStarted={onGetStarted} />
+        <PricingSection onGetStarted={handleGetStarted} />
       </main>
 
       {/* ── Footer ────────────────────────────────────────────────── */}
