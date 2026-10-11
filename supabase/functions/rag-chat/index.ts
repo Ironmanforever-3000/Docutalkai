@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { embed } from "../_shared/embed.ts";
+import { callGroq, type ChatMsg } from "../_shared/groq.ts";
 
 interface PcaModel {
   loadings: number[][];
@@ -44,38 +45,48 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 async function callLLM(
-  messages: Array<{ role: string; content: string }>,
+  system: string,
+  messages: ChatMsg[],
   apiKey: string,
-  provider: string,
-  systemPrompt: string
+  provider: string
 ): Promise<string> {
+  if (provider === "groq") {
+    const key = apiKey || Deno.env.get("GROQ_API_KEY") || "";
+    const { text, model } = await callGroq({
+      apiKey: key,
+      system,
+      messages,
+    });
+    console.log(`[RAG-Chat] Groq answered with ${model}`);
+    return text;
+  }
+
   if (provider === "anthropic") {
     const key = apiKey || Deno.env.get("ANTHROPIC_API_KEY") || "";
     if (!key) throw new Error("No API key for Anthropic");
 
-    const model = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-3-5-sonnet-20241022";
+    const model = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-5-5";
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-api-key": key,
         "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
       },
       body: JSON.stringify({
         model,
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: messages.slice(-20),
+        max_tokens: 2048,
+        system,
+        messages,
       }),
     });
 
     if (!res.ok) {
-      throw new Error(`Anthropic API error: ${res.status} ${await res.text()}`);
+      throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
 
     const json = await res.json();
-    return (json as { content: Array<{ text: string }> }).content[0]?.text || "";
+    return json.content?.[0]?.text ?? "";
   }
 
   if (provider === "openai") {
@@ -91,61 +102,18 @@ async function callLLM(
       },
       body: JSON.stringify({
         model,
-        messages: [{ role: "system", content: systemPrompt }, ...messages.slice(-20)],
-        max_tokens: 4096,
+        max_tokens: 2048,
         temperature: 0.3,
+        messages: [{ role: "system", content: system }, ...messages],
       }),
     });
 
     if (!res.ok) {
-      throw new Error(`OpenAI API error: ${res.status} ${await res.text()}`);
+      throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
 
     const json = await res.json();
-    return (
-      (json as { choices: Array<{ message: { content: string } }> }).choices[0]
-        ?.message?.content || ""
-    );
-  }
-
-  if (provider === "groq") {
-    const key = apiKey || Deno.env.get("GROQ_API_KEY") || "";
-    if (!key) throw new Error("No API key for Groq");
-
-    const modelString = Deno.env.get("GROQ_MODELS") ?? "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b,llama-3.3-70b-versatile,llama-3.1-8b-instant";
-    const groqModels = modelString.split(',').map(m => m.trim());
-
-    let lastError = "";
-    for (const model of groqModels) {
-      try {
-        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${key}`,
-          },
-          body: JSON.stringify({
-            model,
-            messages: [{ role: "system", content: systemPrompt }, ...messages.slice(-20)],
-            max_tokens: 4096,
-            temperature: 0.3,
-          }),
-        });
-
-        if (res.ok) {
-          const json = await res.json();
-          return json.choices?.[0]?.message?.content || "";
-        }
-
-        lastError = `HTTP ${res.status} ${await res.text()}`;
-        console.warn(`Groq model "${model}" failed: ${lastError}`);
-      } catch (fetchErr) {
-        lastError = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        console.warn(`Groq model "${model}" fetch error:`, fetchErr);
-      }
-    }
-
-    throw new Error(`All Groq models failed. Last error: ${lastError}`);
+    return json.choices?.[0]?.message?.content ?? "";
   }
 
   throw new Error(`Unsupported provider: ${provider}`);
@@ -338,7 +306,10 @@ ${contextBlock}`
         : `You are DocuTalk AI, an intelligent document assistant. Answer the user's question to the best of your ability. If no document context is available, let them know and offer suggestions (upload files, paste text, etc.).`,
     };
 
-    const llmMessages = [...history, { role: "user" as const, content: message }];
+    const chat: ChatMsg[] = [...history, { role: "user", content: message }]
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .slice(-12);
+    while (chat.length && chat[0].role !== "user") chat.shift(); // Anthropic must start with a user turn
 
     console.log(`[RAG-Chat] Prompt Construction:`);
     console.log(`  System message length: ${systemMessage.content.length} chars`);
@@ -346,7 +317,7 @@ ${contextBlock}`
     console.log(`  History messages: ${history.length}`);
     console.log(`[RAG-Chat] Calling ${provider} LLM...`);
 
-    const response = await callLLM(llmMessages, apiKey, provider, systemMessage.content);
+    const response = await callLLM(systemMessage.content, chat, apiKey, provider);
 
     return jsonResponse({
       response,

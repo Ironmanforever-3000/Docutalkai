@@ -55,6 +55,34 @@ export async function syncDataSource(dataSourceId: string): Promise<DataSourceAc
   return invokeDataSourceFunction('sync', dataSourceId);
 }
 
+// ─── Edge Function Error Helper ──────────────────────────────────────────────
+
+export async function functionErrorMessage(err: unknown): Promise<string> {
+  if (err && typeof err === 'object' && 'context' in err) {
+    const res = (err as { context: unknown }).context;
+    if (res && typeof res === 'object') {
+      try {
+        const cloned = typeof (res as Response).clone === 'function' ? (res as Response).clone() : res;
+        if (typeof (cloned as Response).json === 'function') {
+          const json = await (cloned as Response).json();
+          if (json?.error) return String(json.error);
+          if (json?.message) return String(json.message);
+        }
+      } catch {
+        try {
+          if (typeof (res as Response).text === 'function') {
+            const text = await (res as Response).text();
+            if (text) return text;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 // ─── General Chat (via Edge Function) ────────────────────────────────────────
 
 /**
@@ -81,12 +109,17 @@ export async function generalChat(
       history,
       documents: [],
       apiKey: apiKey || '',
-      provider: provider || 'openai',
+      provider: provider || 'groq',
     },
   });
 
   if (error) {
-    throw new Error(error.message || 'Chat function unavailable');
+    const msg = await functionErrorMessage(error);
+    throw new Error(msg || 'Chat function unavailable');
+  }
+
+  if (data?.error) {
+    throw new Error(data.error as string);
   }
 
   return (data as { response: string }).response || 'No response generated.';
@@ -143,7 +176,12 @@ export async function ragChat(
   });
 
   if (error) {
-    throw new Error(error.message || 'RAG chat function unavailable');
+    const msg = await functionErrorMessage(error);
+    throw new Error(msg || 'RAG chat function unavailable');
+  }
+
+  if (data?.error) {
+    throw new Error(data.error as string);
   }
 
   return data as RagChatResult;

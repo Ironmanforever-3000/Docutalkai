@@ -110,6 +110,8 @@ export default function DocuTalkPage() {
     setTestResult(null);
   };
 
+  const [chatError, setChatError] = useState<string | null>(null);
+
   const testConnection = async () => {
     setTesting(true);
     setTestResult(null);
@@ -126,7 +128,8 @@ export default function DocuTalkPage() {
       });
 
       if (!error && data?.success) {
-        setTestResult({ ok: true, message: `Connected! ${provider} responded successfully.` });
+        const modelNote = data?.model ? ` (${data.model})` : '';
+        setTestResult({ ok: true, message: `Connected! ${provider} responded successfully${modelNote}.` });
       } else {
         const errorMsg = data?.error || error?.message || 'Connection failed';
         setTestResult({ ok: false, message: errorMsg });
@@ -473,6 +476,7 @@ export default function DocuTalkPage() {
     const userMessage = input.trim();
     setInput('');
     setLoading(true);
+    setChatError(null);
 
     try {
       const { data: userData, error: userError } = await supabase
@@ -529,28 +533,28 @@ export default function DocuTalkPage() {
       }
 
       if (!responseText) {
-        responseText = `⚠️ **AI connection failed.**\n\nLast error: ${lastError}\n\nCheck your API key in ⚙️ Settings or verify your .env file.`;
-      }
+        setChatError(lastError || 'AI connection failed. Check edge function logs for details.');
+      } else {
+        const { data: aiData, error: aiError } = await supabase
+          .from('chat_messages')
+          .insert({
+            user_id: user.id,
+            session_id: sessionId,
+            role: 'assistant',
+            content: responseText,
+          })
+          .select()
+          .single();
 
-      const { data: aiData, error: aiError } = await supabase
-        .from('chat_messages')
-        .insert({
-          user_id: user.id,
-          session_id: sessionId,
-          role: 'assistant',
-          content: responseText,
-        })
-        .select()
-        .single();
-
-      if (aiError) throw aiError;
-      if (aiData) {
-        setMessages((prev) => [...prev, aiData as ChatMessage]);
-        if (currentSources.length > 0) {
-          setMessageSources((prev) => ({ ...prev, [aiData.id]: currentSources }));
-        }
-        if (currentQueryCoordinate) {
-          setQueryCoordinates((prev) => ({ ...prev, [aiData.id]: currentQueryCoordinate }));
+        if (aiError) throw aiError;
+        if (aiData) {
+          setMessages((prev) => [...prev, aiData as ChatMessage]);
+          if (currentSources.length > 0) {
+            setMessageSources((prev) => ({ ...prev, [aiData.id]: currentSources }));
+          }
+          if (currentQueryCoordinate) {
+            setQueryCoordinates((prev) => ({ ...prev, [aiData.id]: currentQueryCoordinate }));
+          }
         }
       }
     } catch (err) {
@@ -939,10 +943,21 @@ export default function DocuTalkPage() {
             </div>
           )}
 
-          {/* Drag hint */}
-          {isDraggingOver && (
-            <div className="absolute inset-x-4 pointer-events-none flex items-center justify-center gap-2 text-ember-400 text-sm font-medium py-1">
-              <Paperclip className="w-4 h-4" /> Drop to load document into RAG context
+          {/* Chat error notification */}
+          {chatError && (
+            <div className="mb-3 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-300 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-semibold text-red-200">AI connection failed</p>
+                <p className="mt-0.5 text-red-300/90 whitespace-pre-wrap">{chatError}</p>
+              </div>
+              <button
+                onClick={() => setChatError(null)}
+                className="text-red-400 hover:text-red-200 text-xs px-1"
+                aria-label="Dismiss error"
+              >
+                ✕
+              </button>
             </div>
           )}
 
@@ -1029,7 +1044,7 @@ export default function DocuTalkPage() {
                 <div className="space-y-1 text-ash">
                   <div className="flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-emerald-400 flex-shrink-0" />
-                    <span><span className="text-emerald-300 font-medium">Embeddings:</span> OpenAI text-embedding-3-small (always)</span>
+                    <span><span className="text-emerald-300 font-medium">Embeddings:</span> Voyage AI voyage-3 (1024d)</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-ember-400 flex-shrink-0" />
@@ -1047,9 +1062,9 @@ export default function DocuTalkPage() {
                   onChange={(e) => setProvider(e.target.value)}
                   className="w-full px-3 py-2 bg-ink-800 border border-ink-700 rounded-lg text-sm text-parchment focus:outline-none focus:border-ember-500"
                 >
-                  <option value="groq">⚡ Groq — Llama-3.1-8b-instant (Recommended — Fast)</option>
-                  <option value="openai">OpenAI — GPT-4o-mini</option>
-                  <option value="anthropic">Anthropic — Claude Sonnet 4.5</option>
+                  <option value="groq">⚡ Groq — GPT-OSS 120B / Qwen (Recommended — Fast)</option>
+                  <option value="anthropic">Anthropic — Claude Sonnet</option>
+                  <option value="openai">OpenAI — GPT-4o-mini (Credits Required)</option>
                 </select>
               </div>
 
@@ -1057,7 +1072,7 @@ export default function DocuTalkPage() {
                 <label className="block text-xs font-semibold text-ash mb-2">
                   GENERATION API KEY{' '}
                   <span className="text-ash/50 font-normal">
-                    (optional; use a provider key only if you want to test the connection)
+                    (optional; only needed if overriding Supabase secrets)
                   </span>
                 </label>
                 <input
@@ -1089,7 +1104,7 @@ export default function DocuTalkPage() {
               )}
 
               <div className="p-3 bg-ember-500/10 border border-ember-500/20 rounded-lg text-xs text-ember-400">
-                💡 The generation provider handles both embedding and response. When the rag-chat edge function is deployed to Supabase, set <code>VOYAGE_API_KEY</code> or <code>OPENAI_API_KEY</code> as a Secret.
+                💡 Document vectors are embedded via Voyage AI (<code>voyage-3</code>). Edge functions securely read <code>VOYAGE_API_KEY</code> and <code>GROQ_API_KEY</code> from Supabase secrets.
               </div>
             </div>
 
