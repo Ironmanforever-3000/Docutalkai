@@ -114,6 +114,7 @@ Be helpful, accurate, and concise. If you cannot find relevant information in th
     if (!responseText && (apiKey || Deno.env.get("GROQ_API_KEY"))) {
       try {
         const groqApiKey = apiKey || Deno.env.get("GROQ_API_KEY");
+        const groqModel = Deno.env.get("GROQ_MODEL") ?? "openai/gpt-oss-120b";
         const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -121,7 +122,7 @@ Be helpful, accurate, and concise. If you cannot find relevant information in th
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: "llama-3.3-70b-versatile",
+            model: groqModel,
             messages: messages,
             temperature: 0.7,
             max_tokens: 2048,

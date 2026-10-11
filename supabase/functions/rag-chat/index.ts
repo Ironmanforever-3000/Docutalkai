@@ -112,7 +112,7 @@ async function callLLM(
     const key = apiKey || Deno.env.get("GROQ_API_KEY") || "";
     if (!key) throw new Error("No API key for Groq");
 
-    const modelString = Deno.env.get("GROQ_MODELS") ?? "llama-3.3-70b-versatile,llama-3.1-8b-instant";
+    const modelString = Deno.env.get("GROQ_MODELS") ?? "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b,llama-3.3-70b-versatile,llama-3.1-8b-instant";
     const groqModels = modelString.split(',').map(m => m.trim());
 
     let lastError = "";
