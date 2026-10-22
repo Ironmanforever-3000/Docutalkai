@@ -1,322 +1,538 @@
+// supabase/functions/process-document/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { computeChunkCoordinates } from "./pcaProjection.ts";
 import { embed } from "../_shared/embed.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-Client-Info, Apikey",
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+// Target ~450 tokens (~1,800 chars) with ~15% sentence overlap (~270 chars)
+const TARGET_CHUNK_CHARS = 1800;
+const OVERLAP_CHARS = 270;
+
+// Voyage batching & Edge Function wall-clock safety budget
+const VOYAGE_BATCH_SIZE = 64;
+const VOYAGE_FREE_TIER_DELAY_MS = 20_000; // Set to 0 if payment method is attached
+const MAX_EXECUTION_BUDGET_MS = 110_000;  // Self-chain before Supabase 150s hard wall-clock limit
+
+export interface StructuredChunk {
+  chunkIndex: number;
+  headingPath: string;
+  content: string; // Includes Document + Section breadcrumb prefix
 }
 
-// ── Chunking ───────────────────────────────────────────────────────────────────
+interface HeadingNode {
+  level: number;
+  title: string;
+}
 
-const TARGET_TOKENS = 600;
-const MAX_CHARS = TARGET_TOKENS * 4;
-const OVERLAP_PARAS = 1;
+/**
+ * Detects Markdown headings (# to ####) and structured PDF section headers
+ * (e.g., "1.2 Scope of Work" or "SECTION 4: INDEMNIFICATION").
+ */
+function detectHeading(line: string): HeadingNode | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length > 120) return null;
 
-function chunkText(text: string): string[] {
-  const normalized = text.replace(/\r\n?/g, "\n");
-  const paragraphs = normalized.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
+  // 1. Standard Markdown Heading (# to ####)
+  const mdMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+  if (mdMatch) {
+    return {
+      level: mdMatch[1].length,
+      title: mdMatch[2].replace(/#+\s*$/, "").trim(),
+    };
+  }
 
-  const chunks: string[] = [];
-  let currentChunk: string[] = [];
-  let currentLength = 0;
+  // 2. Numbered PDF Section Headings (e.g., "1. Introduction", "2.3.1 Warranty Terms")
+  const numberedMatch = trimmed.match(/^(\d+(?:\.\d+){0,3})\.?\s+([A-Z][A-Za-z0-9\s,&/-]{2,80})$/);
+  if (numberedMatch && !trimmed.endsWith(".")) {
+    const depth = numberedMatch[1].split(".").length;
+    return {
+      level: Math.min(depth, 4),
+      title: `${numberedMatch[1]} ${numberedMatch[2].trim()}`,
+    };
+  }
 
-  const pushChunk = () => {
-    if (currentChunk.length > 0) {
-      chunks.push(currentChunk.join("\n\n"));
-      currentChunk = [];
-      currentLength = 0;
+  return null;
+}
+
+/**
+ * Splits oversized text along sentence boundaries while preserving overlap.
+ */
+function splitOversizedParagraph(text: string, maxChars: number, overlapChars: number): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g) ?? [text];
+  const results: string[] = [];
+  let current = "";
+
+  for (const sentence of sentences) {
+    const s = sentence.trim();
+    if (!s) continue;
+
+    if ((current + " " + s).trim().length <= maxChars) {
+      current = current ? `${current} ${s}` : s;
+    } else {
+      if (current) {
+        results.push(current);
+        const tail = current.slice(-overlapChars);
+        const firstSpace = tail.indexOf(" ");
+        const cleanOverlap = firstSpace !== -1 ? tail.slice(firstSpace + 1) : tail;
+        current = `${cleanOverlap} ${s}`.trim();
+      } else {
+        // Single sentence exceeds maxChars — hard slice as last resort
+        for (let i = 0; i < s.length; i += maxChars - overlapChars) {
+          results.push(s.slice(i, i + maxChars));
+        }
+        current = "";
+      }
     }
+  }
+
+  if (current) results.push(current);
+  return results;
+}
+
+/**
+ * Splits large Markdown tables across chunks while repeating column headers
+ * at the top of each continuation chunk.
+ */
+function splitMarkdownTable(tableBlock: string, maxChars: number): string[] {
+  const rows = tableBlock.trim().split("\n");
+  if (rows.length <= 3 || tableBlock.length <= maxChars) {
+    return [tableBlock];
+  }
+
+  const headerRow = rows[0];
+  const separatorRow = rows[1].includes("---") ? rows[1] : "| --- |";
+  const dataStartIndex = rows[1].includes("---") ? 2 : 1;
+  const tableHeaderPrefix = `${headerRow}\n${separatorRow}`;
+
+  const tableChunks: string[] = [];
+  let currentChunk = tableHeaderPrefix;
+
+  for (let i = dataStartIndex; i < rows.length; i++) {
+    const row = rows[i];
+    if ((currentChunk + "\n" + row).length > maxChars && currentChunk !== tableHeaderPrefix) {
+      tableChunks.push(currentChunk);
+      currentChunk = `${tableHeaderPrefix}\n${row}`;
+    } else {
+      currentChunk += `\n${row}`;
+    }
+  }
+
+  if (currentChunk !== tableHeaderPrefix) {
+    tableChunks.push(currentChunk);
+  }
+
+  return tableChunks;
+}
+
+/**
+ * Structure-aware chunker that tracks heading breadcrumbs and keeps atomic blocks intact.
+ */
+export function chunkDocumentWithBreadcrumbs(
+  rawText: string,
+  documentTitle: string
+): StructuredChunk[] {
+  const normalized = rawText.replace(/\r\n/g, "\n").trim();
+  if (!normalized) return [];
+
+  const lines = normalized.split("\n");
+  const headingStack: HeadingNode[] = [];
+
+  interface SectionBlock {
+    breadcrumb: string;
+    paragraphs: string[];
+  }
+
+  const sections: SectionBlock[] = [];
+  let currentParagraphLines: string[] = [];
+  let currentSection: SectionBlock = {
+    breadcrumb: "Overview",
+    paragraphs: [],
+  };
+  sections.push(currentSection);
+
+  let inCodeFence = false;
+  let inTable = false;
+
+  const getBreadcrumbString = () =>
+    headingStack.length > 0 ? headingStack.map((h) => h.title).join(" > ") : "Overview";
+
+  const flushParagraph = () => {
+    const joined = currentParagraphLines.join("\n").trim();
+    if (joined) {
+      currentSection.paragraphs.push(joined);
+    }
+    currentParagraphLines = [];
   };
 
-  for (const para of paragraphs) {
-    if (para.length > MAX_CHARS) {
-      pushChunk();
-      let lineBuf = "";
-      for (const line of para.split("\n")) {
-        if (lineBuf && lineBuf.length + line.length + 1 > MAX_CHARS) {
-          chunks.push(lineBuf);
-          lineBuf = line;
-        } else {
-          lineBuf = lineBuf ? `${lineBuf}\n${line}` : line;
-        }
-        while (lineBuf.length > MAX_CHARS) {
-          chunks.push(lineBuf.slice(0, MAX_CHARS));
-          lineBuf = lineBuf.slice(MAX_CHARS);
-        }
-      }
-      if (lineBuf) chunks.push(lineBuf);
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Protect fenced code blocks from heading detection or blank-line splitting
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      currentParagraphLines.push(line);
+      if (!inCodeFence) flushParagraph();
       continue;
     }
 
-    if (currentLength + para.length > MAX_CHARS && currentChunk.length > 0) {
-      pushChunk();
-
-      const overlapStart = Math.max(0, currentChunk.length - OVERLAP_PARAS);
-      currentChunk = currentChunk.slice(overlapStart);
-      currentLength = currentChunk.reduce((sum, p) => sum + p.length, 0);
+    if (inCodeFence) {
+      currentParagraphLines.push(line);
+      continue;
     }
 
-    currentChunk.push(para);
-    currentLength += para.length;
+    // Group contiguous Markdown table rows together
+    const isTableRow = trimmed.startsWith("|") && trimmed.endsWith("|");
+    if (isTableRow) {
+      if (!inTable) {
+        flushParagraph();
+        inTable = true;
+      }
+      currentParagraphLines.push(line);
+      continue;
+    } else if (inTable) {
+      flushParagraph();
+      inTable = false;
+    }
+
+    // Check for section heading
+    const heading = detectHeading(line);
+    if (heading) {
+      flushParagraph();
+
+      while (
+        headingStack.length > 0 &&
+        headingStack[headingStack.length - 1].level >= heading.level
+      ) {
+        headingStack.pop();
+      }
+      headingStack.push(heading);
+
+      currentSection = {
+        breadcrumb: getBreadcrumbString(),
+        paragraphs: [],
+      };
+      sections.push(currentSection);
+      continue;
+    }
+
+    // Blank line marks paragraph boundary
+    if (!trimmed) {
+      flushParagraph();
+    } else {
+      currentParagraphLines.push(line);
+    }
   }
+  flushParagraph();
 
-  if (currentChunk.length > 0) chunks.push(currentChunk.join("\n\n"));
+  // Pack section paragraphs into chunks and prepend breadcrumb headers
+  const finalChunks: StructuredChunk[] = [];
+  let chunkIndex = 0;
 
-  if (chunks.length === 0 && normalized.trim().length > 0) {
-    for (let i = 0; i < normalized.length; i += MAX_CHARS) {
-      chunks.push(normalized.slice(i, i + MAX_CHARS));
+  for (const section of sections) {
+    if (section.paragraphs.length === 0) continue;
+
+    const headerPrefix = `[Document: ${documentTitle} | Section: ${section.breadcrumb}]\n\n`;
+    const bodyBudget = Math.max(TARGET_CHUNK_CHARS - headerPrefix.length, 600);
+
+    let buffer = "";
+
+    const emitChunk = (bodyText: string) => {
+      const cleanBody = bodyText.trim();
+      if (!cleanBody) return;
+      finalChunks.push({
+        chunkIndex: chunkIndex++,
+        headingPath: section.breadcrumb,
+        content: `${headerPrefix}${cleanBody}`,
+      });
+    };
+
+    for (const para of section.paragraphs) {
+      const isTableBlock = para.startsWith("|") && para.includes("\n|");
+
+      if (isTableBlock) {
+        if (buffer) {
+          emitChunk(buffer);
+          buffer = "";
+        }
+        const tableSlices = splitMarkdownTable(para, bodyBudget);
+        for (const slice of tableSlices) {
+          emitChunk(slice);
+        }
+        continue;
+      }
+
+      if (para.length > bodyBudget) {
+        if (buffer) {
+          emitChunk(buffer);
+          buffer = "";
+        }
+        const subChunks = splitOversizedParagraph(para, bodyBudget, OVERLAP_CHARS);
+        for (const sub of subChunks) {
+          emitChunk(sub);
+        }
+        continue;
+      }
+
+      if ((buffer + "\n\n" + para).trim().length <= bodyBudget) {
+        buffer = buffer ? `${buffer}\n\n${para}` : para;
+      } else {
+        emitChunk(buffer);
+        const tail = buffer.slice(-OVERLAP_CHARS);
+        const firstBreak = tail.indexOf(" ");
+        const overlapSnippet = firstBreak !== -1 ? tail.slice(firstBreak + 1).trim() : "";
+        buffer = overlapSnippet ? `${overlapSnippet}\n\n${para}` : para;
+      }
+    }
+
+    if (buffer) {
+      emitChunk(buffer);
     }
   }
 
-  return chunks;
+  return finalChunks;
 }
 
-// ── Embedding ──────────────────────────────────────────────────────────────────
+/**
+ * Computes centered 2D coordinates for DocuTalk AI's 2D semantic chunk visualizer.
+ */
+function compute2DProjection(embeddings: number[][]): { x: number; y: number }[] {
+  if (embeddings.length === 0) return [];
+  const dim = embeddings[0].length;
 
-const VOYAGE_MIN_INTERVAL_MS = 20_000;
-const VOYAGE_BATCH_SIZE = 4;
+  const rawCoords = embeddings.map((vec) => {
+    let x = 0;
+    let y = 0;
+    for (let i = 0; i < dim; i++) {
+      x += vec[i] * Math.cos((i * 17) % 360);
+      y += vec[i] * Math.sin((i * 31) % 360);
+    }
+    return { x, y };
+  });
 
+  const xs = rawCoords.map((c) => c.x);
+  const ys = rawCoords.map((c) => c.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const spanX = maxX - minX || 1;
+  const spanY = maxY - minY || 1;
 
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return rawCoords.map((c) => ({
+    x: Number((((c.x - minX) / spanX) * 2 - 1).toFixed(4)),
+    y: Number((((c.y - minY) / spanY) * 2 - 1).toFixed(4)),
+  }));
 }
 
+/**
+ * Self-chains the next Edge Function invocation if approaching the timeout budget.
+ */
+async function spawnNextInvocation(
+  documentId: string,
+  nextOffset: number,
+  fallbackAuthHeader: string
+): Promise<void> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
+  if (!supabaseUrl) return;
 
-// ── Self-chaining ──────────────────────────────────────────────────────────────
+  const authHeader = serviceKey ? `Bearer ${serviceKey}` : fallbackAuthHeader;
 
-async function spawnNextInvocation(documentId: string, userId: string) {
-  try {
-    const baseUrl = (Deno.env.get("SUPABASE_URL") ?? "").replace(/\/$/, "");
-    const svcKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-    await fetch(`${baseUrl}/functions/v1/process-document`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${svcKey}`,
-        apikey: svcKey,
-      },
-      body: JSON.stringify({ document_id: documentId, user_id: userId, is_chain: true }),
-    });
-  } catch (err) {
-    console.error("Failed to spawn next process-document invocation:", err);
-  }
+  await fetch(`${supabaseUrl}/functions/v1/process-document`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      document_id: documentId,
+      start_offset: nextOffset,
+    }),
+  }).catch((err) => {
+    console.error("[process-document] Self-chain invocation failed:", err);
+  });
 }
-
-// ── Main handler ───────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
+  const startTime = Date.now();
+  const callerAuthHeader = req.headers.get("Authorization") ?? "";
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+
+  const supabase = createClient(
+    supabaseUrl,
+    supabaseServiceKey || supabaseAnonKey,
+    callerAuthHeader && !supabaseServiceKey
+      ? { global: { headers: { Authorization: callerAuthHeader } } }
+      : undefined
+  );
+
+  let documentId: string | null = null;
+
   try {
-    const { document_id, user_id, is_chain } = await req.json();
+    const body = await req.json();
+    documentId = body.document_id;
+    const startOffset: number = body.start_offset ?? 0;
 
-    let supabase;
-    let currentUserId: string;
-    let serviceRoleClient;
-
-    const authHeader = req.headers.get("Authorization");
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-
-    const isAdmin = authHeader === `Bearer ${serviceRoleKey}`;
-
-    if (isAdmin) {
-      supabase = createClient(supabaseUrl, serviceRoleKey);
-      serviceRoleClient = supabase;
-      if (!user_id) {
-        return jsonResponse({ error: "user_id is required for service role calls" }, 400);
-      }
-      currentUserId = user_id;
-    } else {
-      if (!authHeader) {
-        return jsonResponse({ error: "Missing Authorization header" }, 401);
-      }
-
-      supabase = createClient(
-        supabaseUrl,
-        Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-        { global: { headers: { Authorization: authHeader } } }
-      );
-      serviceRoleClient = createClient(supabaseUrl, serviceRoleKey);
-
-      const {
-        data: { user },
-        error: authError,
-      } = await supabase.auth.getUser();
-      if (authError || !user) {
-        return jsonResponse({ error: "Unauthorized" }, 401);
-      }
-      currentUserId = user.id;
+    if (!documentId) {
+      return new Response(JSON.stringify({ error: "document_id is required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    if (!document_id) {
-      return jsonResponse({ error: "document_id is required" }, 400);
-    }
-
-    const { data: doc, error: docError } = await supabase
+    // 1. Fetch document record
+    const { data: doc, error: docErr } = await supabase
       .from("documents")
-      .select("id, name, extracted_text, content_text, user_id, status")
-      .eq("id", document_id)
-      .eq("user_id", currentUserId)
+      .select("id, user_id, name, content_text, extracted_text")
+      .eq("id", documentId)
       .single();
 
-    if (docError || !doc) {
-      return jsonResponse({ error: "Document not found" }, 404);
+    if (docErr || !doc) {
+      throw new Error(`Document not found (${documentId}): ${docErr?.message}`);
     }
 
-    const text = doc.extracted_text || doc.content_text || "";
-    if (!text.trim()) {
+    let rawText: string = doc.content_text || doc.extracted_text || "";
+
+    // If the client offloaded large extracted text (>400KB) to Supabase Storage:
+    if (rawText.startsWith("__STORAGE_SIDECAR__:")) {
+      const sidecarPath = rawText.replace("__STORAGE_SIDECAR__:", "").trim();
+      const { data: sidecarBlob, error: downloadErr } = await supabase.storage
+        .from("documents")
+        .download(sidecarPath);
+
+      if (downloadErr || !sidecarBlob) {
+        throw new Error(
+          `Failed to read sidecar text from storage (${sidecarPath}): ${downloadErr?.message}`
+        );
+      }
+      rawText = await sidecarBlob.text();
+    }
+
+    if (rawText.trim().length < 20) {
       await supabase
         .from("documents")
-        .update({ status: "failed", error_message: "No text content to process" })
-        .eq("id", document_id);
-      return jsonResponse({ error: "No text content in document" }, 400);
+        .update({ status: "failed", error_message: "Document contains no extractable text." })
+        .eq("id", documentId);
+
+      return new Response(
+        JSON.stringify({ error: "Document contains no extractable text." }),
+        { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
-    if (!is_chain) {
-      // Clean slate for new vectorization or reprocess
-      await supabase
-        .from("document_chunks")
-        .delete()
-        .eq("document_id", document_id);
+    // 2. Mark document as processing and clear stale chunks on initial run
+    if (startOffset === 0) {
+      await supabase.from("documents").update({ status: "processing" }).eq("id", documentId);
+      await supabase.from("document_chunks").delete().eq("document_id", documentId);
     }
 
-    await supabase
-      .from("documents")
-      .update({ status: "processing" })
-      .eq("id", document_id);
+    // 3. Generate structure-aware chunks with heading breadcrumbs
+    const allChunks = chunkDocumentWithBreadcrumbs(rawText, doc.name || "Untitled Document");
+    const remainingChunks = allChunks.slice(startOffset);
 
-    const chunks = chunkText(text);
-    console.log(`[Chunking] Document "${doc.name}" (${text.length} chars) → ${chunks.length} chunks`);
-    if (chunks.length === 0) {
-      await supabase
-        .from("documents")
-        .update({ status: "failed", error_message: "No chunks could be created from text" })
-        .eq("id", document_id);
-      return jsonResponse({ error: "No chunks created" }, 400);
-    }
+    let processedUpTo = startOffset;
 
-    const totalChunks = chunks.length;
+    // 4. Process in batches of 64 chunks per Voyage AI request
+    for (let i = 0; i < remainingChunks.length; i += VOYAGE_BATCH_SIZE) {
+      const elapsedMs = Date.now() - startTime;
+      if (i > 0 && elapsedMs > MAX_EXECUTION_BUDGET_MS) {
+        console.log(
+          `[process-document] Approaching timeout (${elapsedMs}ms). Chaining at offset ${processedUpTo}/${allChunks.length}`
+        );
+        if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) {
+          EdgeRuntime.waitUntil(
+            spawnNextInvocation(documentId, processedUpTo, callerAuthHeader)
+          );
+        } else {
+          spawnNextInvocation(documentId, processedUpTo, callerAuthHeader);
+        }
 
-    const { count } = await supabase
-      .from("document_chunks")
-      .select("id", { count: "exact", head: true })
-      .eq("document_id", document_id);
-
-    const processed = count || 0;
-
-    if (processed >= totalChunks) {
-      // Fetch embeddings through the RPC
-      const { data: rows, error: rpcError } = await serviceRoleClient.rpc("get_document_embeddings", {
-        p_doc: document_id
-      });
-
-      if (rpcError || !rows || rows.length === 0) {
-        return jsonResponse({ error: "No chunks to finalize or RPC failed" }, 500);
+        return new Response(
+          JSON.stringify({
+            status: "processing_continued",
+            document_id: documentId,
+            processed_chunks: processedUpTo,
+            total_chunks: allChunks.length,
+          }),
+          { status: 202, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
 
-      const ordered = rows.sort((a, b) => a.chunk_index - b.chunk_index);
-      const embeddings = ordered.map((r) => JSON.parse(r.emb) as number[]);
+      if (i > 0 && VOYAGE_FREE_TIER_DELAY_MS > 0) {
+        await new Promise((r) => setTimeout(r, VOYAGE_FREE_TIER_DELAY_MS));
+      }
 
-      const { coords, model: pcaModel } = computeChunkCoordinates(
-        embeddings.map((e) => e.slice(0, 256))
-      );
+      const batch = remainingChunks.slice(i, i + VOYAGE_BATCH_SIZE);
+      const batchTexts = batch.map((c) => c.content);
 
-      // Save coordinates via RPC to avoid management token for updates
-      const coordPayload = ordered.map((r, i) => ({
-        id: r.id,
-        x: coords[i]?.x ?? 0,
-        y: coords[i]?.y ?? 0
+      const embeddings = await embed(batchTexts, "document");
+      const coords = compute2DProjection(embeddings);
+
+      const rowsToInsert = batch.map((chunk, idx) => ({
+        document_id: doc.id,
+        user_id: doc.user_id,
+        chunk_index: chunk.chunkIndex,
+        content: chunk.content,
+        embedding: embeddings[idx],
+        x_coordinate: coords[idx]?.x ?? 0,
+        y_coordinate: coords[idx]?.y ?? 0,
       }));
 
-      const { error: coordsError } = await serviceRoleClient.rpc("set_chunk_coords", {
-        p_doc: document_id,
-        p_coords: coordPayload
-      });
-      if (coordsError) {
-         console.warn("Failed to set chunk coordinates", coordsError);
+      const { error: insertErr } = await supabase
+        .from("document_chunks")
+        .insert(rowsToInsert);
+
+      if (insertErr) {
+        throw new Error(`Failed inserting chunks: ${insertErr.message}`);
       }
 
-      await supabase
-        .from("documents")
-        .update({ status: "ready", pca_model: JSON.stringify(pcaModel), processed: true })
-        .eq("id", document_id);
+      processedUpTo += batch.length;
+    }
 
-      return jsonResponse({
-        success: true,
-        document_id,
-        chunks_created: totalChunks,
+    // 5. All chunks embedded and stored — mark document ready
+    await supabase
+      .from("documents")
+      .update({
         status: "ready",
-      });
-    }
+        processed: true,
+      })
+      .eq("id", documentId);
 
-    await sleep(VOYAGE_MIN_INTERVAL_MS);
+    return new Response(
+      JSON.stringify({
+        status: "ready",
+        document_id: documentId,
+        total_chunks: allChunks.length,
+      }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  } catch (err: unknown) {
+    console.error("[process-document] Fatal error:", err);
 
-    const batch = chunks.slice(processed, processed + VOYAGE_BATCH_SIZE);
-    console.log(`[Embedding] Processing batch: chunks ${processed}–${processed + batch.length - 1}/${chunks.length}`);
-    const normalizedEmbeddings = await embed(batch, 'document');
-    console.log(`[Embedding] Generated ${normalizedEmbeddings.length} embeddings`);
-
-    const chunkRows = batch.map((content, i) => ({
-      document_id,
-      user_id: currentUserId,
-      chunk_index: processed + i,
-      content,
-      embedding: normalizedEmbeddings[i] || null,
-      token_count: Math.ceil(content.length / 4),
-      x_coordinate: null,
-      y_coordinate: null,
-    }));
-
-    const { error: insertError } = await supabase
-      .from("document_chunks")
-      .insert(chunkRows);
-
-    if (insertError) {
-      console.error("Failed to insert chunks:", insertError);
+    if (documentId) {
       await supabase
         .from("documents")
-        .update({ status: "failed", error_message: insertError.message })
-        .eq("id", document_id);
-      return jsonResponse({ error: insertError.message }, 500);
+        .update({ status: "failed", error_message: err instanceof Error ? err.message : String(err) })
+        .eq("id", documentId)
+        .catch(() => {});
     }
 
-    const done = processed + batch.length;
-    console.log(`[Embedding] Stored ${chunkRows.length} chunks in document_chunks table (total: ${done}/${chunks.length})`);
-
-    if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) {
-      EdgeRuntime.waitUntil(spawnNextInvocation(document_id, currentUserId));
-    } else {
-      spawnNextInvocation(document_id, currentUserId);
-    }
-
-    return jsonResponse({
-      success: true,
-      document_id,
-      status: done < totalChunks ? "processing" : "finalizing",
-      chunks_processed: done,
-      total_chunks: totalChunks,
-      model_used: 'voyage-3',
-    });
-  } catch (error) {
-    console.error("process-document error:", error);
-    const message =
-      error instanceof Error ? error.message : "Internal server error";
-    return jsonResponse({ error: message }, 500);
+    return new Response(
+      JSON.stringify({ error: err instanceof Error ? err.message : "Failed to process document" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   }
 });

@@ -1,122 +1,28 @@
+// supabase/functions/rag-chat/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { embed } from "../_shared/embed.ts";
-import { callGroq, type ChatMsg } from "../_shared/groq.ts";
-
-interface PcaModel {
-  loadings: number[][];
-  center: number[];
-  bounds: { xMin: number; xMax: number; yMin: number; yMax: number };
-}
-
-function projectQuery(
-  embedding: number[],
-  model: PcaModel
-): { x: number; y: number } {
-  const { loadings, center, bounds } = model;
-  if (!loadings.length) return { x: 0, y: 0 };
-
-  const centered = embedding.map((v, i) => v - (center[i] ?? 0));
-  const rawX = centered.reduce((sum, v, i) => sum + v * (loadings[i]?.[0] ?? 0), 0);
-  const rawY = centered.reduce((sum, v, i) => sum + v * (loadings[i]?.[1] ?? 0), 0);
-
-  const range = 100;
-  const xSpan = bounds.xMax - bounds.xMin || 1;
-  const ySpan = bounds.yMax - bounds.yMin || 1;
-
-  return {
-    x: ((rawX - bounds.xMin) / xSpan) * range - range / 2,
-    y: ((rawY - bounds.yMin) / ySpan) * range - range / 2,
-  };
-}
+import {
+  streamChatWithFallback,
+  chatWithFallback,
+  LlmUnavailableError,
+  type StreamChatMessage,
+  type Provider,
+  type ChatMsg,
+} from "../_shared/llm.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-Client-Info, Apikey",
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
-}
+const NEEDS_CONDENSE_REGEX =
+  /\b(it|its|that|this|they|them|their|those|these|he|she|what about|how about|why|and the)\b/i;
 
-async function callLLM(
-  system: string,
-  messages: ChatMsg[],
-  apiKey: string,
-  provider: string
-): Promise<string> {
-  if (provider === "groq") {
-    const key = apiKey || Deno.env.get("GROQ_API_KEY") || "";
-    const { text, model } = await callGroq({
-      apiKey: key,
-      system,
-      messages,
-    });
-    console.log(`[RAG-Chat] Groq answered with ${model}`);
-    return text;
-  }
-
-  if (provider === "anthropic") {
-    const key = apiKey || Deno.env.get("ANTHROPIC_API_KEY") || "";
-    if (!key) throw new Error("No API key for Anthropic");
-
-    const model = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-5-5";
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        system,
-        messages,
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
-
-    const json = await res.json();
-    return json.content?.[0]?.text ?? "";
-  }
-
-  if (provider === "openai") {
-    const key = apiKey || Deno.env.get("OPENAI_API_KEY") || "";
-    if (!key) throw new Error("No API key for OpenAI");
-
-    const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-4o-mini";
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        temperature: 0.3,
-        messages: [{ role: "system", content: system }, ...messages],
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
-
-    const json = await res.json();
-    return json.choices?.[0]?.message?.content ?? "";
-  }
-
-  throw new Error(`Unsupported provider: ${provider}`);
+function formatSSE(payload: Record<string, unknown>): Uint8Array {
+  return new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 Deno.serve(async (req: Request) => {
@@ -127,7 +33,10 @@ Deno.serve(async (req: Request) => {
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
-      return jsonResponse({ error: "Missing Authorization header" }, 401);
+      return new Response(JSON.stringify({ error: "Missing Authorization header" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     const supabase = createClient(
@@ -138,197 +47,246 @@ Deno.serve(async (req: Request) => {
 
     const {
       data: { user },
-      error: authError,
+      error: authErr,
     } = await supabase.auth.getUser();
-    if (authError || !user) {
-      return jsonResponse({ error: "Unauthorized" }, 401);
+
+    if (authErr || !user) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
+    const body = await req.json();
     const {
       message,
       history = [],
-      document_ids = [],
+      document_ids = null,
       provider = "groq",
+      model,
       apiKey = "",
-    } = await req.json();
+      apiKeys,
+      stream = true, // Defaults to SSE streaming
+    } = body;
 
     if (!message) {
-      return jsonResponse({ error: "message is required" }, 400);
+      return new Response(JSON.stringify({ error: "message is required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    let sources: Array<{
-      id: string;
-      document_id: string;
-      document_name: string;
-      chunk_index: number;
-      content: string;
-      content_snippet: string;
-      similarity: number;
-      x_coordinate: number | null;
-      y_coordinate: number | null;
-    }> = [];
-
-    let contextBlock = "";
-    let queryCoordinate: { x: number; y: number; document_id: string } | null = null;
-
-    if (document_ids.length > 0) {
-      try {
-        console.log(`[RAG-Chat] Query: "${message}"`);
-        console.log(`[RAG-Chat] Searching in ${document_ids.length} active document(s)`);
-        
-        const embeddings = await embed([message], 'query');
-        const embedding = embeddings[0];
-        console.log(`[RAG-Chat] Query embedding generated (${embedding.length} dimensions)`);
-
-        const { data: chunks, error: matchError } = await supabase.rpc(
-          "match_document_chunks",
-          {
-            query_embedding: embedding,
-            match_user_id: user.id,
-            match_count: 8,
-            match_threshold: 0.3,
-            match_document_ids: document_ids,
-          }
-        );
-
-        if (matchError) {
-          console.warn("Vector search failed:", matchError);
-        } else if (chunks && (chunks as Array<Record<string, unknown>>).length > 0) {
-          console.log(`[RAG-Chat] Vector search returned ${(chunks as Array<Record<string, unknown>>).length} matches`);
-          const top = chunks as Array<Record<string, unknown>>;
-          
-          top.forEach((c, i) => {
-            const sim = (c.similarity as number) || 0;
-            const docName = (c.document_name as string) || "Unknown";
-            const chunkIdx = (c.chunk_index as number) || 0;
-            const content = ((c.content as string) || "").slice(0, 150).replace(/\n/g, " ");
-            console.log(`  [${i}] "${docName}" chunk ${chunkIdx} (similarity: ${sim.toFixed(3)}): ${content}...`);
-          });
-
-          sources = top.map(
-            (c: Record<string, unknown>) =>
-              ({
-                id: c.id as string,
-                document_id: c.document_id as string,
-                document_name: (c.document_name as string) || "Unknown",
-                chunk_index: (c.chunk_index as number) || 0,
-                content: (c.content as string) || "",
-                content_snippet: ((c.content as string) || "").slice(0, 200),
-                similarity: (c.similarity as number) || 0,
-                x_coordinate: (c.x_coordinate as number) ?? null,
-                y_coordinate: (c.y_coordinate as number) ?? null,
-              } as typeof sources[0])
-          );
-
-          contextBlock = top
-            .map(
-              (c: Record<string, unknown>) =>
-                `<document source="${(c.document_name as string) || "Unknown"}" chunk="${(c.chunk_index as number) || 0}">\n${c.content as string}\n</document>`
-            )
-            .join("\n\n");
-        }
-        // Project query embedding into 2D using first available document's PCA model
-        if (sources.length > 0) {
-          const docId = sources[0].document_id;
-          const { data: pcaDoc } = await supabase
-            .from("documents")
-            .select("pca_model")
-            .eq("id", docId)
-            .single();
-
-          if (pcaDoc?.pca_model) {
-            try {
-              const model = JSON.parse(
-                typeof pcaDoc.pca_model === "string"
-                  ? pcaDoc.pca_model
-                  : JSON.stringify(pcaDoc.pca_model)
-              ) as PcaModel;
-              const qc = projectQuery(embedding, model);
-              queryCoordinate = { x: qc.x, y: qc.y, document_id: docId };
-            } catch {
-              // PCA projection failed silently
-            }
-          }
-        }
-      } catch (vecErr) {
-        console.warn("Vector search error:", vecErr);
-      }
+    // 1. Lightweight contextual query condensing for ambiguous follow-ups
+    let searchQuery = message;
+    const wordCount = message.trim().split(/\s+/).length;
+    if (history.length > 0 && (wordCount < 8 || NEEDS_CONDENSE_REGEX.test(message))) {
+      const recentContext = history
+        .slice(-2)
+        .map((m: { role: string; content: string }) => m.content.slice(0, 200))
+        .join(" | ");
+      searchQuery = `${recentContext} — ${message}`;
     }
 
-    if (!contextBlock && document_ids.length > 0) {
-      // Fallback: fetch full document text directly
-      try {
-        const { data: docs } = await supabase
-          .from("documents")
-          .select("id, name, content_text")
-          .in("id", document_ids)
-          .eq("user_id", user.id);
+    // 2. Embed query (1024-dim Voyage-3) and retrieve chunks via hybrid search
+    const [queryEmbedding] = await embed([searchQuery], "query");
 
-        if (docs && docs.length > 0) {
-          contextBlock = docs
-            .map(
-              (d: { id: string; name: string; content_text?: string }) =>
-                `<document source="${d.name}">\n${(d.content_text || "").slice(0, 3000)}\n</document>`
-            )
-            .join("\n\n");
+    const matchDocIds =
+      Array.isArray(document_ids) && document_ids.length > 0 ? document_ids : null;
 
-          sources = docs.map(
-            (d: { id: string; name: string; content_text?: string }) =>
-              ({
-                id: d.id,
-                document_id: d.id,
-                document_name: d.name,
-                chunk_index: 0,
-                content: d.content_text || "",
-                content_snippet: "",
-                similarity: 0,
-                x_coordinate: null,
-                y_coordinate: null,
-              } as typeof sources[0])
-          );
-        }
-      } catch (fallbackErr) {
-        console.warn("Fallback document fetch failed:", fallbackErr);
-      }
-    }
+    let matchedChunks: Array<Record<string, unknown>> = [];
 
-    const systemMessage = {
-      role: "system" as const,
-      content: contextBlock
-        ? `You are DocuTalk AI, a document-grounded assistant.
-
-Answer using ONLY the context provided below. If the information isn't in the context, say "I couldn't find that in the provided documents."
-
-Always cite the source document name and chunk index for each piece of information.
-
-Context:
-${contextBlock}`
-        : `You are DocuTalk AI, an intelligent document assistant. Answer the user's question to the best of your ability. If no document context is available, let them know and offer suggestions (upload files, paste text, etc.).`,
-    };
-
-    const chat: ChatMsg[] = [...history, { role: "user", content: message }]
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .slice(-12);
-    while (chat.length && chat[0].role !== "user") chat.shift(); // Anthropic must start with a user turn
-
-    console.log(`[RAG-Chat] Prompt Construction:`);
-    console.log(`  System message length: ${systemMessage.content.length} chars`);
-    console.log(`  Context block present: ${contextBlock.length > 0}`);
-    console.log(`  History messages: ${history.length}`);
-    console.log(`[RAG-Chat] Calling ${provider} LLM...`);
-
-    const response = await callLLM(systemMessage.content, chat, apiKey, provider);
-
-    return jsonResponse({
-      response,
-      sources,
-      vectorSearch: !!contextBlock,
-      query_coordinate: queryCoordinate,
+    // Attempt hybrid search RPC
+    const { data: chunks, error: rpcError } = await supabase.rpc("hybrid_match_chunks", {
+      query_text: searchQuery,
+      query_embedding: queryEmbedding,
+      match_user_id: user.id,
+      match_count: 8,
+      match_document_ids: matchDocIds,
     });
-  } catch (error) {
-    console.error("rag-chat error:", error);
-    const message =
-      error instanceof Error ? error.message : "Internal server error";
-    return jsonResponse({ error: message }, 500);
+
+    if (rpcError) {
+      console.warn("hybrid_match_chunks failed, attempting fallback:", rpcError.message);
+      // Fallback to match_document_chunks if hybrid_match_chunks is not yet deployed
+      const { data: legacyChunks } = await supabase.rpc("match_document_chunks", {
+        query_embedding: queryEmbedding,
+        match_user_id: user.id,
+        match_count: 8,
+        match_threshold: 0.25,
+        match_document_ids: matchDocIds,
+      });
+      if (legacyChunks) matchedChunks = legacyChunks;
+    } else if (chunks) {
+      matchedChunks = chunks;
+    }
+
+    // Fetch document titles for source cards
+    const docIds = [
+      ...new Set(matchedChunks.map((c) => c.document_id as string).filter(Boolean)),
+    ];
+    const docNameMap: Record<string, string> = {};
+    if (docIds.length > 0) {
+      const { data: docs } = await supabase
+        .from("documents")
+        .select("id, name")
+        .in("id", docIds);
+      for (const d of docs ?? []) {
+        docNameMap[d.id] = d.name;
+      }
+    }
+
+    const sources = matchedChunks.map((c, idx) => ({
+      citationIndex: idx + 1,
+      id: c.id as string,
+      document_id: c.document_id as string,
+      document_name: (c.document_name as string) || docNameMap[c.document_id as string] || "Document",
+      chunk_index: (c.chunk_index as number) ?? idx,
+      content: (c.content as string) || "",
+      similarity: Number(c.similarity ?? c.rrf_score ?? 0),
+      x_coordinate: (c.x_coordinate as number) ?? null,
+      y_coordinate: (c.y_coordinate as number) ?? null,
+    }));
+
+    // 3. Assemble prompt with strict grounding and citation instructions
+    const contextXml =
+      sources.length > 0
+        ? sources
+            .map(
+              (s) =>
+                `<source id="${s.citationIndex}" document="${s.document_name}" chunk="${s.chunk_index}">\n${s.content}\n</source>`
+            )
+            .join("\n\n")
+        : "<no_matching_passages_found />";
+
+    const systemPrompt = `You are DocuTalk AI, a precise document intelligence assistant.
+Answer the user's question using ONLY the provided <source> passages.
+- Cite facts inline using bracketed numbers like [1] or [2] corresponding to the <source id="...">.
+- If <no_matching_passages_found /> is present or the sources do not contain the answer, clearly state that the active documents do not contain passages matching this question. Never fabricate facts.
+
+Retrieved Passages:
+${contextXml}`;
+
+    const chatHistory = history
+      .filter((m: { role: string; content?: string; isError?: boolean }) =>
+        (m.role === "user" || m.role === "assistant") &&
+        !m.isError &&
+        !(m.content || "").startsWith("AI connection failed")
+      )
+      .slice(-6);
+
+    const streamMessages: StreamChatMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.map((m: { role: "user" | "assistant"; content: string }) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      { role: "user", content: message },
+    ];
+
+    // If caller explicitly requested non-streaming JSON:
+    if (!stream) {
+      const nonStreamHistory: ChatMsg[] = [...chatHistory, { role: "user", content: message }];
+      while (nonStreamHistory.length && nonStreamHistory[0].role !== "user") {
+        nonStreamHistory.shift();
+      }
+
+      const result = await chatWithFallback({
+        requested: provider,
+        system: systemPrompt,
+        messages: nonStreamHistory,
+        keys: { apiKey, apiKeys },
+      });
+
+      return new Response(
+        JSON.stringify({
+          response: result.text,
+          provider_used: result.provider,
+          model_used: result.model,
+          notice: result.notice,
+          sources,
+          vectorSearch: sources.length > 0,
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // 4. Open upstream LLM stream (resolves provider fallback before streaming begins)
+    const {
+      provider: activeProvider,
+      model: activeModel,
+      fallbackNotice,
+      tokenStream,
+    } = await streamChatWithFallback({
+      provider: provider as Provider,
+      model,
+      keys: { apiKey, apiKeys },
+      apiKey,
+      messages: streamMessages,
+    });
+
+    // 5. Stream metadata first, then token deltas, then completion signal
+    const readable = new ReadableStream({
+      async start(controller) {
+        try {
+          controller.enqueue(
+            formatSSE({
+              type: "meta",
+              sources,
+              provider: activeProvider,
+              model: activeModel,
+              fallbackNotice,
+            })
+          );
+
+          for await (const token of tokenStream) {
+            controller.enqueue(
+              formatSSE({
+                type: "token",
+                content: token,
+              })
+            );
+          }
+
+          controller.enqueue(formatSSE({ type: "done" }));
+        } catch (streamErr: unknown) {
+          controller.enqueue(
+            formatSSE({
+              type: "error",
+              message:
+                streamErr instanceof Error
+                  ? streamErr.message
+                  : "Stream interrupted",
+            })
+          );
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(readable, {
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  } catch (err: unknown) {
+    console.error("rag-chat error:", err);
+    if (err instanceof LlmUnavailableError) {
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 502,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    const message = err instanceof Error ? err.message : "Internal server error";
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });

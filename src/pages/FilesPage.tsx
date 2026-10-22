@@ -3,7 +3,7 @@ import { FileText, Upload, Search, Trash2, Download, FileImage, FileSpreadsheet,
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
 import { Document } from '../types';
-import { extractTextFromFile } from '../lib/extraction';
+import { extractTextFromFile, extractDocumentText } from '../lib/extraction';
 
 export default function FilesPage() {
   const { user } = useAuth();
@@ -87,8 +87,11 @@ export default function FilesPage() {
 
     setUploading(true);
     setError(null);
+    const MAX_INLINE_TEXT_CHARS = 400_000;
+    const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+
     setUploadProgress(0);
-    setUploadStatus('Uploading...');
+    setUploadStatus('Starting upload...');
 
     const uploadedDocs: Document[] = [];
     const totalFiles = selectedFiles.length;
@@ -96,51 +99,94 @@ export default function FilesPage() {
     try {
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i];
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
 
-        setUploadStatus(`Uploading ${file.name}...`);
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+          throw new Error(`File "${file.name}" exceeds the 50MB limit (${(file.size / (1024 * 1024)).toFixed(1)}MB).`);
+        }
 
-        // Upload to storage
-        const { data: uploadData, error: uploadError } = await supabase.storage
+        const docId = crypto.randomUUID();
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const binaryStoragePath = `${user.id}/${docId}/${safeName}`;
+        const sidecarTextPath = `${user.id}/${docId}/extracted.md`;
+
+        // Step 1: Streamed client-side extraction with page-by-page RAM cleanup
+        setUploadStatus(`Extracting text from ${file.name}...`);
+        let extractedText = '';
+        let extractionFailed = false;
+        let extractionError: string | null = null;
+        let charCount = 0;
+
+        try {
+          const res = await extractDocumentText(file, (prog) => {
+            const detail = prog.totalPages && prog.currentPage
+              ? `Extracting ${file.name} (p. ${prog.currentPage}/${prog.totalPages})...`
+              : `Extracting ${file.name}...`;
+            setUploadStatus(detail);
+            setUploadProgress(Math.round(((i + (prog.percent / 100)) / totalFiles) * 100));
+          });
+          extractedText = res.text;
+          charCount = res.charCount;
+        } catch (extErr: unknown) {
+          extractionFailed = true;
+          extractionError = extErr instanceof Error ? extErr.message : 'Extraction failed';
+          console.error(`[Extraction] Failed for "${file.name}":`, extErr);
+        }
+
+        // Step 2: Upload original binary file to Supabase Storage
+        setUploadStatus(`Uploading ${file.name} to storage...`);
+        const { error: uploadError } = await supabase.storage
           .from('documents')
-          .upload(fileName, file, {
+          .upload(binaryStoragePath, file, {
             cacheControl: '3600',
-            upsert: false,
+            upsert: true,
           });
 
         if (uploadError) throw uploadError;
 
-        // Extract text content for RAG
-        setUploadStatus(`Processing ${file.name} for RAG...`);
-        const extractionResult = await extractTextFromFile(file);
-
-        if (extractionResult.status === 'failed') {
-          console.error(`[Extraction] FAILED — "${file.name}" (${file.size} bytes): ${extractionResult.errorMessage}`);
+        // Step 3: If extracted text > 400KB, offload to Storage sidecar to prevent PostgREST 413
+        const isLargeText = extractedText.length > MAX_INLINE_TEXT_CHARS;
+        if (isLargeText) {
+          setUploadStatus(`Saving text sidecar for ${file.name}...`);
+          const textBlob = new Blob([extractedText], { type: 'text/markdown;charset=utf-8' });
+          const { error: sidecarErr } = await supabase.storage
+            .from('documents')
+            .upload(sidecarTextPath, textBlob, {
+              contentType: 'text/markdown;charset=utf-8',
+              upsert: true,
+            });
+          if (sidecarErr) {
+            console.warn(`[Sidecar] Failed to upload sidecar: ${sidecarErr.message}`);
+          }
         }
 
-        // Create document record with proper schema columns
+        const inlineContent = isLargeText
+          ? `__STORAGE_SIDECAR__:${sidecarTextPath}`
+          : extractedText;
+
+        // Step 4: Register document in Postgres with lightweight payload
+        setUploadStatus(`Registering ${file.name}...`);
         const { data: docData, error: docError } = await supabase
           .from('documents')
           .insert({
+            id: docId,
             name: file.name,
             file_type: file.type || 'application/octet-stream',
-            storage_path: uploadData?.path,
+            storage_path: binaryStoragePath,
             user_id: user.id,
             project_id: selectedProjectId || null,
-            status: extractionResult.status,
-            extracted_text: extractionResult.text,
-            char_count: extractionResult.charCount,
-            error_message: extractionResult.errorMessage,
-            content_text: extractionResult.text,
-            processed: extractionResult.status === 'ready',
+            status: extractionFailed ? 'failed' : 'processing',
+            extracted_text: isLargeText ? null : extractedText,
+            char_count: charCount,
+            error_message: extractionError,
+            content_text: inlineContent,
+            processed: false,
           })
           .select()
           .single();
 
         if (docError) throw docError;
 
-        if (docData) {
+        if (docData && !extractionFailed) {
           uploadedDocs.push(docData);
           // Trigger vector embedding in the background
           supabase.functions.invoke('process-document', {

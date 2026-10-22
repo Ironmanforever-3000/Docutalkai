@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import Logo from './Logo';
 
@@ -10,6 +10,22 @@ export default function AuthPage() {
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const { signIn, signUp, signInWithGoogle } = useAuth();
+
+  useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search);
+    let errorDesc = searchParams.get('error_description') || searchParams.get('error');
+
+    if (!errorDesc && window.location.hash) {
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+      errorDesc = hashParams.get('error_description') || hashParams.get('error');
+    }
+
+    if (errorDesc) {
+      const decoded = decodeURIComponent(errorDesc.replace(/\+/g, ' '));
+      setError(`Sign-in error: ${decoded}`);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -129,7 +145,9 @@ export default function AuthPage() {
             </div>
 
             {error && (
-              <div className="text-red-400 text-sm">{error}</div>
+              <div className="p-3 bg-red-950/60 border border-red-800/80 rounded-lg text-red-300 text-sm leading-relaxed">
+                {error}
+              </div>
             )}
 
             <button

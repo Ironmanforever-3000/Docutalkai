@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { FileText, FolderKanban, Database, ArrowRight, Bot, Clock, FileUp } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
@@ -6,7 +7,7 @@ import { supabase } from '../lib/supabase';
 type Page = 'Home' | 'Files' | 'Projects' | 'DataSources' | 'Library' | 'DocuTalk' | 'Settings';
 
 interface HomePageProps {
-  onNavigate: (page: Page) => void;
+  onNavigate?: (page: Page) => void;
 }
 
 interface Stats {
@@ -26,6 +27,24 @@ interface Activity {
 
 export default function HomePage({ onNavigate }: HomePageProps) {
   const { user } = useAuth();
+  const navigate = useNavigate();
+
+  const handleNavigate = (page: Page) => {
+    if (onNavigate) {
+      onNavigate(page);
+      return;
+    }
+    const routeMap: Record<Page, string> = {
+      Home: '/app',
+      Files: '/app/files',
+      Projects: '/app/projects',
+      DataSources: '/app/data-sources',
+      Library: '/app/files',
+      DocuTalk: '/app/chat',
+      Settings: '/app/settings',
+    };
+    navigate(routeMap[page] || '/app');
+  };
   const [stats, setStats] = useState<Stats>({
     documents: 0,
     projects: 0,
@@ -169,7 +188,7 @@ export default function HomePage({ onNavigate }: HomePageProps) {
           return (
             <button
               key={action.page}
-              onClick={() => onNavigate(action.page)}
+              onClick={() => handleNavigate(action.page)}
               className={`p-6 rounded-xl border transition-all hover:scale-[1.02] group ${colorClasses}`}
             >
               <Icon className="w-8 h-8 mb-4" />
@@ -197,19 +216,19 @@ export default function HomePage({ onNavigate }: HomePageProps) {
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-4">
-              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => onNavigate('Files')}>
+              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => handleNavigate('Files')}>
                 <p className="text-3xl font-bold text-ember-400">{stats.documents}</p>
                 <p className="text-sm text-ash">Documents</p>
               </div>
-              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => onNavigate('Projects')}>
+              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => handleNavigate('Projects')}>
                 <p className="text-3xl font-bold text-purple-400">{stats.projects}</p>
                 <p className="text-sm text-ash">Projects</p>
               </div>
-              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => onNavigate('DataSources')}>
+              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => handleNavigate('DataSources')}>
                 <p className="text-3xl font-bold text-green-400">{stats.dataSources}</p>
                 <p className="text-sm text-ash">Data Sources</p>
               </div>
-              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => onNavigate('DocuTalk')}>
+              <div className="p-4 bg-ink-800 rounded-lg hover:bg-ink-700 transition-colors cursor-pointer" onClick={() => handleNavigate('DocuTalk')}>
                 <p className="text-3xl font-bold text-orange-400">{stats.chatMessages}</p>
                 <p className="text-sm text-ash">Chat Messages</p>
               </div>

@@ -1,5 +1,14 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { callGroq } from "../_shared/groq.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
+import {
+  candidateKeys,
+  callProvider,
+  providerStatus,
+  providerName,
+  isProvider,
+  LlmError,
+  type Provider,
+} from "../_shared/llm.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -14,87 +23,94 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
+const PREFIX: Record<Provider, string> = {
+  groq: "gsk_",
+  anthropic: "sk-ant-",
+  openai: "sk-",
+};
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
-  if (req.method !== 'POST') {
-    return jsonResponse({ error: 'Method not allowed' }, 405);
+  if (req.method !== "POST") {
+    return jsonResponse({ success: false, error: "Method not allowed" }, 405);
   }
 
   try {
-    const body = await req.json();
-    const { provider, apiKey } = body;
-
-    if (!provider || !apiKey) {
-      return jsonResponse({ error: 'provider and apiKey are required' }, 400);
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) {
+      return jsonResponse({ error: "Missing Authorization header" }, 401);
     }
 
-    if (provider === 'groq') {
-      const { model } = await callGroq({
-        apiKey,
-        system: 'Reply with just the word "ok".',
-        messages: [{ role: 'user', content: 'ping' }],
-        maxTokens: 256,
-      });
-      return jsonResponse({ success: true, model });
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
+      { global: { headers: { Authorization: authHeader } } }
+    );
+
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
-    if (provider === 'anthropic') {
-      const model = Deno.env.get('ANTHROPIC_MODEL') ?? 'claude-sonnet-5-5';
-      const providerRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
+    const body = await req.json().catch(() => ({}));
+    const { action, provider, apiKey, apiKeys } = body;
+
+    if (action === "status") {
+      return jsonResponse(providerStatus(), 200);
+    }
+
+    if (!provider || !isProvider(provider)) {
+      return jsonResponse({ success: false, error: "Valid provider is required" }, 200);
+    }
+
+    const candidates = candidateKeys(provider, { apiKey, apiKeys });
+    if (candidates.length === 0) {
+      const name = providerName(provider);
+      const prefix = PREFIX[provider];
+      return jsonResponse(
+        {
+          success: false,
+          error: `No usable ${name} key. Keys for this provider start with ${prefix}. Paste one in AI Settings or set the server secret.`,
+          kind: "config",
         },
-        body: JSON.stringify({
-          model,
-          max_tokens: 100,
-          system: 'Reply with just the word "ok".',
-          messages: [{ role: 'user', content: 'ping' }],
-        }),
-      });
-
-      if (!providerRes.ok) {
-        const text = await providerRes.text().catch(() => 'No response body');
-        return jsonResponse({ error: `Provider responded with ${providerRes.status}: ${text}` }, 400);
-      }
-
-      return jsonResponse({ success: true, model });
+        200
+      );
     }
 
-    if (provider === 'openai') {
-      const model = Deno.env.get('OPENAI_MODEL') ?? 'gpt-4o-mini';
-      const providerRes = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: 'Reply with just the word "ok".' },
-            { role: 'user', content: 'ping' },
-          ],
-          max_tokens: 100,
-        }),
-      });
-
-      if (!providerRes.ok) {
-        const text = await providerRes.text().catch(() => 'No response body');
-        return jsonResponse({ error: `Provider responded with ${providerRes.status}: ${text}` }, 400);
+    let lastError: LlmError | Error | null = null;
+    for (const { key, source } of candidates) {
+      try {
+        const { model } = await callProvider(provider, {
+          key,
+          system: "Reply with OK.",
+          messages: [{ role: "user", content: "ping" }],
+          maxTokens: 256,
+        });
+        return jsonResponse({ success: true, model, keySource: source }, 200);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
       }
-
-      return jsonResponse({ success: true, model });
     }
 
-    return jsonResponse({ error: `Unsupported provider: ${provider}` }, 400);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Provider test failed';
-    return jsonResponse({ error: msg }, 500);
+    const name = providerName(provider);
+    const kind = lastError instanceof LlmError ? lastError.kind : "bad_request";
+    const detail = lastError instanceof LlmError ? lastError.message : (lastError?.message ?? "test failed");
+    return jsonResponse(
+      {
+        success: false,
+        error: `${name} ${detail}`,
+        kind,
+      },
+      200
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Provider test failed";
+    return jsonResponse({ success: false, error: msg }, 200);
   }
 });

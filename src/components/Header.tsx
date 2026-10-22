@@ -7,7 +7,7 @@ import { supabase } from '../lib/supabase';
 import { Notification } from '../types';
 
 interface HeaderProps {
-  user: User;
+  user: User | null;
 }
 
 export default function Header({ user }: HeaderProps) {
@@ -195,15 +195,15 @@ export default function Header({ user }: HeaderProps) {
                 />
               ) : (
                 <span className="text-parchment font-semibold text-sm">
-                  {(profile?.display_name || user.email)?.charAt(0).toUpperCase()}
+                  {(profile?.display_name || user?.email || 'U')?.charAt(0).toUpperCase()}
                 </span>
               )}
             </div>
             <div className="text-left">
               <p className="text-sm font-medium text-parchment">
-                {profile?.display_name || user.email?.split('@')[0]}
+                {profile?.display_name || user?.email?.split('@')[0] || 'User'}
               </p>
-              <p className="text-xs text-ash">{user.email}</p>
+              <p className="text-xs text-ash">{user?.email || ''}</p>
             </div>
           </button>
         </div>

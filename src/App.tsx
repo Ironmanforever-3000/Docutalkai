@@ -52,7 +52,8 @@ function AppContent() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={user ? <Navigate to="/app" replace /> : <LandingPage />} />
+        <Route path="/" element={user ? <Navigate to="/app" replace /> : <Navigate to="/login" replace />} />
+        <Route path="/landing" element={<LandingPage />} />
         <Route path="/login" element={user ? <Navigate to="/app" replace /> : <AuthPage />} />
         <Route path="/app" element={user ? <Shell /> : <Navigate to="/login" replace />}>
           <Route index element={<HomePage />} />

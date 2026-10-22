@@ -57,33 +57,28 @@ export async function syncDataSource(dataSourceId: string): Promise<DataSourceAc
 
 // ─── Edge Function Error Helper ──────────────────────────────────────────────
 
-export async function functionErrorMessage(err: unknown): Promise<string> {
-  if (err && typeof err === 'object' && 'context' in err) {
-    const res = (err as { context: unknown }).context;
-    if (res && typeof res === 'object') {
-      try {
-        const cloned = typeof (res as Response).clone === 'function' ? (res as Response).clone() : res;
-        if (typeof (cloned as Response).json === 'function') {
-          const json = await (cloned as Response).json();
-          if (json?.error) return String(json.error);
-          if (json?.message) return String(json.message);
-        }
-      } catch {
-        try {
-          if (typeof (res as Response).text === 'function') {
-            const text = await (res as Response).text();
-            if (text) return text;
-          }
-        } catch {
-          // ignore
-        }
-      }
+export async function functionErrorMessage(error: unknown): Promise<string> {
+  const ctx = (error as { context?: Response }).context;
+  if (ctx && typeof ctx.clone === "function") {
+    try {
+      const body = await ctx.clone().json();
+      return body.error ?? body.message ?? JSON.stringify(body);
+    } catch {
+      /* body was not JSON */
     }
   }
-  return err instanceof Error ? err.message : String(err);
+  return error instanceof Error ? error.message : String(error);
 }
 
 // ─── General Chat (via Edge Function) ────────────────────────────────────────
+
+export interface GeneralChatResult {
+  response: string;
+  provider_used?: string;
+  model_used?: string;
+  notice?: string | null;
+  timestamp?: string;
+}
 
 /**
  * Calls the chat Edge Function for general Q&A without RAG context.
@@ -91,9 +86,9 @@ export async function functionErrorMessage(err: unknown): Promise<string> {
 export async function generalChat(
   message: string,
   history: Array<{ role: string; content: string }>,
-  apiKey?: string,
+  apiKeys?: Partial<Record<string, string>>,
   provider?: string
-): Promise<string> {
+): Promise<GeneralChatResult> {
   const {
     data: { session },
   } = await supabase.auth.getSession();
@@ -102,13 +97,20 @@ export async function generalChat(
     throw new Error('No active session');
   }
 
+  const filteredKeys: Record<string, string> = {};
+  if (apiKeys) {
+    for (const [k, v] of Object.entries(apiKeys)) {
+      if (v && v.trim()) filteredKeys[k] = v.trim();
+    }
+  }
+
   const { data, error } = await supabase.functions.invoke('chat', {
     headers: { Authorization: `Bearer ${session.access_token}` },
     body: {
       message,
       history,
       documents: [],
-      apiKey: apiKey || '',
+      apiKeys: Object.keys(filteredKeys).length ? filteredKeys : undefined,
       provider: provider || 'groq',
     },
   });
@@ -122,7 +124,13 @@ export async function generalChat(
     throw new Error(data.error as string);
   }
 
-  return (data as { response: string }).response || 'No response generated.';
+  return {
+    response: (data as { response: string }).response || 'No response generated.',
+    provider_used: data?.provider_used,
+    model_used: data?.model_used,
+    notice: data?.notice ?? null,
+    timestamp: data?.timestamp,
+  };
 }
 
 // ─── RAG Chat (via Edge Function) ────────────────────────────────────────────
@@ -139,11 +147,14 @@ export interface RagChatSource {
   y_coordinate: number | null;
 }
 
-interface RagChatResult {
+export interface RagChatResult {
   response: string;
   sources: RagChatSource[];
   vectorSearch: boolean;
   query_coordinate?: { x: number; y: number; document_id: string } | null;
+  provider_used?: string;
+  model_used?: string;
+  notice?: string | null;
 }
 
 /**
@@ -153,7 +164,7 @@ export async function ragChat(
   message: string,
   history: Array<{ role: string; content: string }>,
   documentIds: string[],
-  apiKey?: string,
+  apiKeys?: Partial<Record<string, string>>,
   provider?: string
 ): Promise<RagChatResult> {
   const {
@@ -164,13 +175,20 @@ export async function ragChat(
     throw new Error('No active session');
   }
 
+  const filteredKeys: Record<string, string> = {};
+  if (apiKeys) {
+    for (const [k, v] of Object.entries(apiKeys)) {
+      if (v && v.trim()) filteredKeys[k] = v.trim();
+    }
+  }
+
   const { data, error } = await supabase.functions.invoke('rag-chat', {
     headers: { Authorization: `Bearer ${session.access_token}` },
     body: {
       message,
       history,
       document_ids: documentIds,
-      apiKey: apiKey || '',
+      apiKeys: Object.keys(filteredKeys).length ? filteredKeys : undefined,
       provider: provider || 'groq',
     },
   });
@@ -184,5 +202,13 @@ export async function ragChat(
     throw new Error(data.error as string);
   }
 
-  return data as RagChatResult;
+  return {
+    response: (data as { response: string }).response || 'No response generated.',
+    sources: (data as { sources: RagChatSource[] }).sources || [],
+    vectorSearch: !!(data as { vectorSearch: boolean }).vectorSearch,
+    query_coordinate: (data as { query_coordinate?: { x: number; y: number; document_id: string } | null }).query_coordinate,
+    provider_used: data?.provider_used,
+    model_used: data?.model_used,
+    notice: data?.notice ?? null,
+  };
 }

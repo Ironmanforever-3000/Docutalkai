@@ -89,6 +89,20 @@ export interface Message {
   timestamp: Date;
 }
 
+export interface SourceCitation {
+  citationIndex: number;
+  id: string;
+  document_id: string;
+  document_name: string;
+  chunk_index: number;
+  content: string;
+  similarity: number;
+  x_coordinate?: number | null;
+  y_coordinate?: number | null;
+}
+
+export type Provider = 'groq' | 'anthropic' | 'openai';
+
 export interface ChatMessage {
   id: string;
   user_id: string;
@@ -96,6 +110,13 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   created_at: string;
+  isError?: boolean;
+  provider_used?: string;
+  model_used?: string;
+  notice?: string | null;
+  sources?: SourceCitation[];
+  isStreaming?: boolean;
+  status?: 'thinking' | 'streaming' | 'done' | 'error';
 }
 
 export interface ChatSession {

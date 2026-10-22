@@ -1,12 +1,49 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { Send, Bot, User, Trash2, Copy, Check, FileText, Settings, AlertCircle, Paperclip, X, Loader2, Download, Zap, Database, MessageSquarePlus } from 'lucide-react';
+import { Send, Bot, User, Trash2, Copy, Check, FileText, Settings, AlertCircle, Paperclip, X, Loader2, Download, Zap, Database, MessageSquarePlus, Square, Compass } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
-import { supabase, ragChat, generalChat, syncDataSource } from '../lib/supabase';
-import { Document, ChatMessage, DataSource, Source } from '../types';
+import { supabase, syncDataSource, functionErrorMessage } from '../lib/supabase';
+import { Document, ChatMessage, DataSource, Provider, SourceCitation } from '../types';
 import { extractTextFromFile } from '../lib/extraction';
-import { RetrievalVisualizer } from '../components/RetrievalVisualizer';
-import { useDocumentChunkMap } from '../hooks/useDocumentChunkMap';
+
+
+import { CitedMessage } from '../components/CitedMessage';
+import { SemanticMapCanvas, type MapChunkNode } from '../components/SemanticMapCanvas';
+
+const SETTINGS_KEY_V2 = 'docutalk_settings.v2';
+
+interface ServerStatus {
+  default: Provider;
+  order: Provider[];
+  providers: Record<Provider, { serverKey: 'ok' | 'missing' | 'malformed'; model: string }>;
+}
+
+function maskKey(key: string): string {
+  if (!key) return '';
+  if (key.length <= 8) return '••••••••';
+  return `${key.slice(0, 4)}••••••••${key.slice(-4)}`;
+}
+
+function validateKeyPrefix(p: Provider, raw: string): string | null {
+  const k = raw.trim();
+  if (!k) return null;
+  if (p === 'anthropic') {
+    if (k.startsWith('gsk_')) return 'This looks like a Groq key (gsk_...), not an Anthropic key.';
+    if (k.startsWith('sk-') && !k.startsWith('sk-ant-')) return 'This looks like an OpenAI key (sk-...), not an Anthropic key.';
+    if (!k.startsWith('sk-ant-')) return 'Anthropic keys start with sk-ant-...';
+  }
+  if (p === 'groq') {
+    if (k.startsWith('sk-ant-')) return 'This looks like an Anthropic key (sk-ant-...), not a Groq key.';
+    if (k.startsWith('sk-')) return 'This looks like an OpenAI key (sk-...), not a Groq key.';
+    if (!k.startsWith('gsk_')) return 'Groq keys start with gsk_...';
+  }
+  if (p === 'openai') {
+    if (k.startsWith('gsk_')) return 'This looks like a Groq key (gsk_...), not an OpenAI key.';
+    if (k.startsWith('sk-ant-')) return 'This looks like an Anthropic key (sk-ant-...), not an OpenAI key.';
+    if (!k.startsWith('sk-')) return 'OpenAI keys start with sk-...';
+  }
+  return null;
+}
 
 export default function DocuTalkPage() {
   const { user } = useAuth();
@@ -29,8 +66,18 @@ export default function DocuTalkPage() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
 
-  const [apiKey, setApiKey] = useState<string>('');
-  const [provider, setProvider] = useState<string>('openai');
+  const [apiKeys, setApiKeys] = useState<Record<Provider, string>>({
+    groq: '',
+    anthropic: '',
+    openai: '',
+  });
+  const [provider, setProvider] = useState<Provider>('groq');
+  const [draftKey, setDraftKey] = useState<string>('');
+  const [isEditingKey, setIsEditingKey] = useState(false);
+  const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [migrationToast, setMigrationToast] = useState<string | null>(null);
+  const [providerHint, setProviderHint] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [testing, setTesting] = useState(false);
@@ -49,17 +96,14 @@ export default function DocuTalkPage() {
   const [attachedFileName, setAttachedFileName] = useState<string | null>(null);
   const [attachError, setAttachError] = useState<string | null>(null);
 
-  // Sources for each assistant message (message id → sources)
-  const [messageSources, setMessageSources] = useState<Record<string, Source[]>>({});
-
-  // Query PCA coordinates per message (message id → coordinate)
-  const [queryCoordinates, setQueryCoordinates] = useState<
-    Record<string, { x: number; y: number; document_id: string }>
-  >({});
-
-  // First selected document ID for the chunk map
-  const mapDocId = selectedDocIds.size === 1 ? [...selectedDocIds][0] : null;
-  const { nodes: chunkMapNodes } = useDocumentChunkMap(mapDocId);
+  // Streaming & RAG visualizer states
+  const [isStreaming, setIsStreaming] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const [focusedChunkId, setFocusedChunkId] = useState<string | null>(null);
+  const [activeTurnSources, setActiveTurnSources] = useState<SourceCitation[]>([]);
+  const [allDocumentChunks, setAllDocumentChunks] = useState<MapChunkNode[]>([]);
+  const [showMap, setShowMap] = useState(false);
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -67,7 +111,7 @@ export default function DocuTalkPage() {
     if (user) {
       loadSessions();
       initializeRagContext();
-      loadApiKey();
+      loadSettingsV2();
     }
     // Functions are stable — they only read `user` from closure,
     // so they are intentionally omitted from deps to avoid re-triggering.
@@ -75,39 +119,197 @@ export default function DocuTalkPage() {
   }, [user]);
 
   useEffect(() => {
+    abortControllerRef.current?.abort();
+    setIsStreaming(false);
+    setFocusedChunkId(null);
+    setActiveTurnSources([]);
     if (sessionId) {
       loadMessages(sessionId);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  /**
-   * Loads API key from localStorage first, then falls back to the correct
-   * .env variable based on the saved provider.
-   * Default provider is 'groq' (fast LLM) — embeddings always use OpenAI.
-   */
-  const loadApiKey = () => {
-    const savedProvider = localStorage.getItem('docutalk_provider') || 'groq';
-    const savedKey = localStorage.getItem('docutalk_api_key') || '';
-    if (savedKey) setApiKey(savedKey);
-    setProvider(savedProvider);
+  // Abort ongoing stream on component unmount
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
+  // Load 2D chunk coordinates for map visualization
+  useEffect(() => {
+    const loadChunksForMap = async () => {
+      if (!user) return;
+      try {
+        let query = supabase
+          .from('document_chunks')
+          .select('id, document_id, chunk_index, content, x_coordinate, y_coordinate')
+          .order('chunk_index', { ascending: true })
+          .limit(600);
+
+        if (selectedDocIds.size > 0) {
+          query = query.in('document_id', Array.from(selectedDocIds));
+        } else if (documents.length > 0) {
+          query = query.in('document_id', documents.slice(0, 5).map((d) => d.id));
+        } else {
+          setAllDocumentChunks([]);
+          return;
+        }
+
+        const { data, error } = await query;
+        if (!error && data) {
+          setAllDocumentChunks(data as MapChunkNode[]);
+        }
+      } catch (err) {
+        console.warn('Failed to load chunks for map:', err);
+      }
+    };
+
+    loadChunksForMap();
+  }, [user, selectedDocIds, documents]);
+
+  const loadSettingsV2 = () => {
+    try {
+      const rawV2 = localStorage.getItem(SETTINGS_KEY_V2);
+      if (rawV2) {
+        const parsed = JSON.parse(rawV2);
+        if (parsed && typeof parsed === 'object') {
+          const prov: Provider = (['groq', 'anthropic', 'openai'] as string[]).includes(parsed.provider)
+            ? (parsed.provider as Provider)
+            : 'groq';
+          const keys = {
+            groq: typeof parsed.keys?.groq === 'string' ? parsed.keys.groq.trim() : '',
+            anthropic: typeof parsed.keys?.anthropic === 'string' ? parsed.keys.anthropic.trim() : '',
+            openai: typeof parsed.keys?.openai === 'string' ? parsed.keys.openai.trim() : '',
+          };
+          setProvider(prov);
+          setApiKeys(keys);
+          return;
+        }
+      }
+
+      // One-time legacy migration
+      const legacyKey = (localStorage.getItem('docutalk_api_key') || '').trim();
+      const legacyProv = (localStorage.getItem('docutalk_provider') || 'groq') as Provider;
+      const initialKeys: Record<Provider, string> = { groq: '', anthropic: '', openai: '' };
+
+      if (legacyKey) {
+        if (legacyKey.startsWith('gsk_')) {
+          initialKeys.groq = legacyKey;
+        } else if (legacyKey.startsWith('sk-ant-')) {
+          initialKeys.anthropic = legacyKey;
+        } else if (legacyKey.startsWith('sk-')) {
+          initialKeys.openai = legacyKey;
+        } else {
+          setMigrationToast("Your saved API key didn't match any provider and was removed.");
+        }
+      }
+
+      const initialProvider: Provider = (['groq', 'anthropic', 'openai'] as string[]).includes(legacyProv)
+        ? legacyProv
+        : 'groq';
+
+      const v2Data = { provider: initialProvider, keys: initialKeys };
+      localStorage.setItem(SETTINGS_KEY_V2, JSON.stringify(v2Data));
+      localStorage.removeItem('docutalk_api_key');
+      localStorage.removeItem('docutalk_provider');
+
+      setProvider(initialProvider);
+      setApiKeys(initialKeys);
+    } catch (err) {
+      console.error('Error loading/migrating settings:', err);
+      setProvider('groq');
+      setApiKeys({ groq: '', anthropic: '', openai: '' });
+    }
   };
 
-  const saveApiKey = (key: string, prov: string) => {
-    localStorage.setItem('docutalk_api_key', key);
-    localStorage.setItem('docutalk_provider', prov);
-    setApiKey(key);
-    setProvider(prov);
-    setTestResult(null);
-    setShowSettings(false);
+  const loadServerStatus = async () => {
+    try {
+      const { data, error } = await supabase.functions.invoke('test-provider', {
+        body: { action: 'status' },
+      });
+      if (!error && data?.providers) {
+        const status = data as ServerStatus;
+        setServerStatus(status);
+        const currentKey = apiKeys[provider]?.trim();
+        const sKey = status.providers[provider]?.serverKey;
+        if (!currentKey && sKey !== 'ok') {
+          const fallbackProv = status.default || 'groq';
+          if (fallbackProv !== provider) {
+            setProviderHint(`${provider} has no API key configured. Preselected ${fallbackProv}.`);
+            setProvider(fallbackProv);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load server provider status:', e);
+    }
   };
 
-  const resetToEnvDefaults = () => {
-    localStorage.removeItem('docutalk_api_key');
-    localStorage.removeItem('docutalk_provider');
-    setApiKey('');
-    setProvider('groq');
+  useEffect(() => {
+    if (showSettings) {
+      loadServerStatus();
+      setDraftKey(apiKeys[provider] || '');
+      setIsEditingKey(false);
+      setTestResult(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSettings]);
+
+  const handleProviderChange = (newProv: Provider) => {
+    setProvider(newProv);
+    setDraftKey(apiKeys[newProv] || '');
+    setIsEditingKey(false);
     setTestResult(null);
+    setProviderHint(null);
+  };
+
+  const handleKeyChange = (val: string) => {
+    setDraftKey(val.trim());
+    setIsEditingKey(true);
+  };
+
+  const currentKeyError = isEditingKey
+    ? validateKeyPrefix(provider, draftKey)
+    : (apiKeys[provider] ? validateKeyPrefix(provider, apiKeys[provider]) : null);
+
+  const handleSaveSettings = () => {
+    if (currentKeyError) return;
+    const nextKeys = { ...apiKeys };
+    if (isEditingKey) {
+      nextKeys[provider] = draftKey.trim();
+    }
+    try {
+      localStorage.setItem(
+        SETTINGS_KEY_V2,
+        JSON.stringify({ provider, keys: nextKeys })
+      );
+      setApiKeys(nextKeys);
+      setIsEditingKey(false);
+      setTestResult(null);
+      setShowSettings(false);
+    } catch (err) {
+      console.error('Failed to save settings:', err);
+    }
+  };
+
+  const handleResetDefaults = () => {
+    try {
+      const defaultProv = serverStatus?.default || 'groq';
+      const emptyKeys = { groq: '', anthropic: '', openai: '' };
+      localStorage.setItem(
+        SETTINGS_KEY_V2,
+        JSON.stringify({ provider: defaultProv, keys: emptyKeys })
+      );
+      setProvider(defaultProv);
+      setApiKeys(emptyKeys);
+      setDraftKey('');
+      setIsEditingKey(false);
+      setTestResult(null);
+      setProviderHint(null);
+    } catch (err) {
+      console.error('Failed to reset settings:', err);
+    }
   };
 
   const [chatError, setChatError] = useState<string | null>(null);
@@ -117,25 +319,38 @@ export default function DocuTalkPage() {
     setTestResult(null);
 
     try {
-      const resolvedKey = apiKey;
-      if (!resolvedKey) {
-        setTestResult({ ok: false, message: `Enter an API key for ${provider} to test the connection.` });
-        return;
+      const effectiveKeys = { ...apiKeys };
+      if (isEditingKey) {
+        effectiveKeys[provider] = draftKey.trim();
+      }
+      const activeKeysPayload: Partial<Record<Provider, string>> = {};
+      for (const [p, k] of Object.entries(effectiveKeys) as [Provider, string][]) {
+        if (k && k.trim()) activeKeysPayload[p] = k.trim();
       }
 
       const { data, error } = await supabase.functions.invoke('test-provider', {
-        body: { provider, apiKey: resolvedKey },
+        body: {
+          provider,
+          apiKeys: Object.keys(activeKeysPayload).length ? activeKeysPayload : undefined,
+        },
       });
 
-      if (!error && data?.success) {
-        const modelNote = data?.model ? ` (${data.model})` : '';
-        setTestResult({ ok: true, message: `Connected! ${provider} responded successfully${modelNote}.` });
-      } else {
-        const errorMsg = data?.error || error?.message || 'Connection failed';
+      if (error) {
+        const errorMsg = await functionErrorMessage(error);
         setTestResult({ ok: false, message: errorMsg });
+      } else if (data?.success) {
+        const modelNote = data?.model ? ` (${data.model})` : '';
+        const sourceNote = data?.keySource ? `, ${data.keySource} key` : '';
+        setTestResult({
+          ok: true,
+          message: `Connected! ${provider} responded successfully${modelNote}${sourceNote}.`,
+        });
+      } else {
+        setTestResult({ ok: false, message: data?.error || 'Connection failed' });
       }
     } catch (err) {
-      setTestResult({ ok: false, message: err instanceof Error ? err.message : 'Connection failed' });
+      const errorMsg = await functionErrorMessage(err);
+      setTestResult({ ok: false, message: errorMsg });
     } finally {
       setTesting(false);
     }
@@ -187,7 +402,10 @@ export default function DocuTalkPage() {
         .order('created_at', { ascending: true });
 
       if (error) throw error;
-      setMessages(data || []);
+      const cleanMessages = (data || []).filter(
+        (m: ChatMessage) => !m.content.startsWith('AI connection failed')
+      );
+      setMessages(cleanMessages);
     } catch (err) {
       console.error('Error loading messages:', err);
     }
@@ -470,97 +688,309 @@ export default function DocuTalkPage() {
 
 
 
+  const handleStopGenerating = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsStreaming(false);
+    setLoading(false);
+  };
+
+  const handleFocusChunkOnMap = (chunkId: string, messageSources?: SourceCitation[]) => {
+    setFocusedChunkId(chunkId);
+    if (messageSources && messageSources.length > 0) {
+      setActiveTurnSources(messageSources);
+    }
+    setShowMap(true);
+    setTimeout(() => {
+      mapContainerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 60);
+  };
+
   const handleSend = async () => {
-    if (!input.trim() || loading || !user || !sessionId) return;
+    if (!input.trim() || loading || isStreaming || !user || !sessionId) return;
 
     const userMessage = input.trim();
     setInput('');
     setLoading(true);
     setChatError(null);
 
+    const userMsgId = crypto.randomUUID();
+    const assistantMsgId = crypto.randomUUID();
+
+    const userChatMessage: ChatMessage = {
+      id: userMsgId,
+      user_id: user.id,
+      session_id: sessionId,
+      role: 'user',
+      content: userMessage,
+      created_at: new Date().toISOString(),
+    };
+
+    const assistantPlaceholder: ChatMessage = {
+      id: assistantMsgId,
+      user_id: user.id,
+      session_id: sessionId,
+      role: 'assistant',
+      content: '',
+      created_at: new Date().toISOString(),
+      status: 'thinking',
+      isStreaming: true,
+      sources: [],
+    };
+
+    const priorHistory = messages
+      .filter((m) => !m.isError && !(m.content || '').startsWith('AI connection failed'))
+      .slice(-12)
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    setMessages((prev) => [...prev, userChatMessage, assistantPlaceholder]);
+    setIsStreaming(true);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    let accumulatedText = '';
+    let tokenQueue = '';
+    let rafId: number | null = null;
+    let streamedSources: SourceCitation[] = [];
+    let usedProvider: Provider = provider;
+    let usedModel: string | undefined;
+
     try {
-      const { data: userData, error: userError } = await supabase
-        .from('chat_messages')
-        .insert({
+      // Save user message to database
+      await supabase.from('chat_messages').insert({
+        id: userMsgId,
+        user_id: user.id,
+        session_id: sessionId,
+        role: 'user',
+        content: userMessage,
+      });
+
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (!session?.access_token) {
+        throw new Error('Your session has expired. Please sign in again.');
+      }
+
+      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/rag-chat`;
+
+      const activeDocIds = documents
+        .filter((d) => selectedDocIds.has(d.id))
+        .map((d) => d.id);
+
+      const response = await fetch(functionUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+          apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({
+          message: userMessage,
+          history: priorHistory,
+          document_ids: activeDocIds,
+          provider,
+          apiKey: apiKeys[provider] || undefined,
+          apiKeys,
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || `Server error (${response.status})`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Browser failed to initialize stream reader.');
+      }
+
+      const decoder = new TextDecoder('utf-8');
+      let sseBuffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        const frames = sseBuffer.split('\n\n');
+        sseBuffer = frames.pop() ?? '';
+
+        for (const frame of frames) {
+          const dataLine = frame.split('\n').find((line) => line.startsWith('data:'));
+          if (!dataLine) continue;
+
+          const jsonStr = dataLine.slice(5).trim();
+          if (!jsonStr || jsonStr === '[DONE]') continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+
+            if (event.type === 'meta') {
+              streamedSources = (event.sources || []) as SourceCitation[];
+              usedProvider = (event.provider as Provider) || provider;
+              usedModel = event.model;
+              if (event.fallbackNotice) {
+                setChatNotice(event.fallbackNotice);
+              }
+              setActiveTurnSources(streamedSources);
+
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId
+                    ? {
+                        ...m,
+                        sources: streamedSources,
+                        provider_used: usedProvider,
+                        model_used: usedModel,
+                        status: 'streaming',
+                      }
+                    : m
+                )
+              );
+            } else if (event.type === 'token') {
+              const tokenStr = typeof event.content === 'string' ? event.content : '';
+              accumulatedText += tokenStr;
+              tokenQueue += tokenStr;
+
+              // Batch token appends once per animation frame
+              if (!rafId) {
+                rafId = requestAnimationFrame(() => {
+                  const chunk = tokenQueue;
+                  tokenQueue = '';
+                  rafId = null;
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === assistantMsgId
+                        ? { ...m, content: m.content + chunk, status: 'streaming' }
+                        : m
+                    )
+                  );
+                });
+              }
+            } else if (event.type === 'error') {
+              throw new Error(event.message || 'Stream generation failed');
+            } else if (event.type === 'done') {
+              if (rafId) {
+                cancelAnimationFrame(rafId);
+                rafId = null;
+              }
+              const finalText = accumulatedText;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsgId
+                    ? {
+                        ...m,
+                        content: finalText,
+                        status: 'done',
+                        isStreaming: false,
+                      }
+                    : m
+                )
+              );
+            }
+          } catch (parseErr) {
+            // Ignore partial frame parse errors
+          }
+        }
+      }
+
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+
+      const finalText = accumulatedText;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: finalText,
+                status: 'done',
+                isStreaming: false,
+                sources: streamedSources,
+                provider_used: usedProvider,
+                model_used: usedModel,
+              }
+            : m
+        )
+      );
+
+      if (finalText.trim()) {
+        await supabase.from('chat_messages').insert({
+          id: assistantMsgId,
           user_id: user.id,
           session_id: sessionId,
-          role: 'user',
-          content: userMessage,
-        })
-        .select()
-        .single();
-
-      if (userError) throw userError;
-      if (userData) {
-        setMessages((prev) => [...prev, userData as ChatMessage]);
+          role: 'assistant',
+          content: finalText,
+        });
+      }
+    } catch (err: unknown) {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
       }
 
-      const history = messages.slice(-10).map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
+      const isAbort =
+        err instanceof Error &&
+        (err.name === 'AbortError' || err.message.includes('aborted'));
 
-      let responseText = '';
-      let lastError = '';
-      let currentSources: Source[] = [];
-      let currentQueryCoordinate: { x: number; y: number; document_id: string } | null = null;
+      if (isAbort) {
+        const partialText = accumulatedText;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: partialText,
+                  status: 'done',
+                  isStreaming: false,
+                }
+              : m
+          )
+        );
 
-      const activeDocs = documents.filter((d) => selectedDocIds.has(d.id));
-
-      try {
-        if (activeDocs.length > 0) {
-          const result = await ragChat(
-            userMessage,
-            history,
-            activeDocs.map((d) => d.id),
-            apiKey || undefined,
-            provider
-          );
-          responseText = result.response;
-          currentSources = result.sources;
-          currentQueryCoordinate = result.query_coordinate ?? null;
-        } else {
-          responseText = await generalChat(
-            userMessage,
-            history,
-            apiKey || undefined,
-            provider
-          );
-        }
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
-        console.warn('Chat failed:', err);
-      }
-
-      if (!responseText) {
-        setChatError(lastError || 'AI connection failed. Check edge function logs for details.');
-      } else {
-        const { data: aiData, error: aiError } = await supabase
-          .from('chat_messages')
-          .insert({
+        if (partialText.trim()) {
+          await supabase.from('chat_messages').insert({
+            id: assistantMsgId,
             user_id: user.id,
             session_id: sessionId,
             role: 'assistant',
-            content: responseText,
-          })
-          .select()
-          .single();
-
-        if (aiError) throw aiError;
-        if (aiData) {
-          setMessages((prev) => [...prev, aiData as ChatMessage]);
-          if (currentSources.length > 0) {
-            setMessageSources((prev) => ({ ...prev, [aiData.id]: currentSources }));
-          }
-          if (currentQueryCoordinate) {
-            setQueryCoordinates((prev) => ({ ...prev, [aiData.id]: currentQueryCoordinate }));
-          }
+            content: partialText,
+          });
         }
+        return;
       }
-    } catch (err) {
-      console.error('Error processing message thread:', err);
+
+      const errorMessage =
+        err instanceof Error ? err.message : 'AI connection failed';
+      console.error('Streaming error:', err);
+
+      setChatError(errorMessage);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: `AI connection failed: ${errorMessage}. If this keeps happening, check your AI settings or the Edge Function logs.`,
+                status: 'error',
+                isStreaming: false,
+                isError: true,
+              }
+            : m
+        )
+      );
     } finally {
+      setIsStreaming(false);
       setLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -684,6 +1114,18 @@ export default function DocuTalkPage() {
         </div>
       </div>
 
+      {migrationToast && (
+        <div className="px-6 py-2 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 text-xs flex justify-between items-center">
+          <span>⚠️ {migrationToast}</span>
+          <button
+            onClick={() => setMigrationToast(null)}
+            className="text-amber-400 hover:text-amber-200 ml-2 text-xs"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {syncNotice && (
         <div className="px-6 py-2 bg-ember-500/10 border-b border-ember-500/20 text-ember-400 text-xs">
           {syncNotice}
@@ -721,6 +1163,9 @@ export default function DocuTalkPage() {
         </div>
       )}
 
+      {/* Main Layout: Chat Column + Collapsible 2D Map Side Panel */}
+      <div className="flex-1 flex flex-col lg:flex-row overflow-hidden min-h-0">
+        <div className="flex-1 flex flex-col overflow-hidden min-h-0">
       {/* Chat messages area */}
       {loadingHistory ? (
         <div className="flex-1 flex items-center justify-center">
@@ -826,17 +1271,27 @@ export default function DocuTalkPage() {
                     : 'bg-ink-800 border border-ink-700 text-parchment'
                 }`}
               >
-                <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
-                {message.role === 'assistant' && messageSources[message.id]?.length > 0 && (
-                  <RetrievalVisualizer
-                    chunks={messageSources[message.id]}
-                    allNodes={chunkMapNodes}
-                    queryCoordinate={queryCoordinates[message.id]}
+                {message.role === 'assistant' ? (
+                  <CitedMessage
+                    content={message.content}
+                    sources={message.sources}
+                    isStreaming={message.isStreaming}
+                    status={message.status}
+                    onLocate={(chunkId) => handleFocusChunkOnMap(chunkId, message.sources)}
+                    onInspectSource={(source) => handleFocusChunkOnMap(source.id, message.sources)}
                   />
+                ) : (
+                  <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
                 )}
                 <div className="flex items-center gap-3 mt-2 text-[10px] text-ash/60">
                   {message.role === 'assistant' && (
                     <>
+                      {message.provider_used && (
+                        <span className="text-[10px] text-ash/50 mr-1">
+                          via {message.provider_used}
+                          {message.model_used ? ` (${message.model_used})` : ''}
+                        </span>
+                      )}
                       <button
                         onClick={() => copyToClipboard(message.id, message.content)}
                         className="hover:text-ember-400 transition-colors"
@@ -943,6 +1398,34 @@ export default function DocuTalkPage() {
             </div>
           )}
 
+          {/* Fallback Notice Banner */}
+          {chatNotice && (
+            <div className="mb-3 p-3 bg-ember-500/10 border border-ember-500/20 rounded-xl text-xs text-ember-300 flex items-start gap-2 justify-between">
+              <div className="flex items-start gap-2 flex-1">
+                <AlertCircle className="w-4 h-4 text-ember-400 shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-semibold text-ember-200">Notice</p>
+                  <p className="mt-0.5 text-ember-300/90 whitespace-pre-wrap">{chatNotice}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => setShowSettings(true)}
+                  className="px-2 py-1 bg-ember-600/30 hover:bg-ember-600/50 text-ember-200 rounded text-xs transition-colors"
+                >
+                  Open AI Settings
+                </button>
+                <button
+                  onClick={() => setChatNotice(null)}
+                  className="text-ember-400 hover:text-ember-200 text-xs px-1"
+                  aria-label="Dismiss notice"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Chat error notification */}
           {chatError && (
             <div className="mb-3 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-300 flex items-start gap-2">
@@ -1005,19 +1488,72 @@ export default function DocuTalkPage() {
               className="flex-1 px-4 py-3 bg-ink-700 border border-ink-700 rounded-xl text-sm text-parchment placeholder-ash/60 focus:outline-none focus:border-ember-500 transition-colors resize-none"
               disabled={loading}
             />
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || loading}
-              className="p-3 bg-ember-600 hover:bg-ember-700 text-parchment rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+            {isStreaming ? (
+              <button
+                type="button"
+                onClick={handleStopGenerating}
+                className="px-4 py-3 bg-red-600/90 hover:bg-red-600 text-parchment rounded-xl transition-colors flex items-center gap-1.5 text-xs font-semibold shrink-0 shadow-lg"
+                title="Stop generating response"
+              >
+                <Square className="w-3.5 h-3.5 fill-current" />
+                Stop
+              </button>
+            ) : (
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() || loading}
+                className="p-3 bg-ember-600 hover:bg-ember-700 text-parchment rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            )}
           </div>
 
           <p className="text-[10px] text-ash/50 mt-1.5 px-1">
             📎 Click the clip icon, drag & drop, or paste (Ctrl+V) a file — PDF, DOCX, TXT, MD, CSV, JSON supported
           </p>
         </div>
+      </div>
+
+        </div>
+
+        {/* 2D Semantic Chunk Map Panel */}
+        {showMap && (
+          <div
+            ref={mapContainerRef}
+            className="w-full lg:w-[420px] xl:w-[460px] h-[360px] lg:h-full border-t lg:border-t-0 lg:border-l border-ink-700 bg-ink-950 flex flex-col flex-shrink-0 animate-in fade-in duration-200"
+          >
+            <div className="flex items-center justify-between px-3 py-2 bg-ink-900 border-b border-ink-700 text-xs">
+              <span className="font-semibold text-parchment flex items-center gap-1.5">
+                <Compass className="w-3.5 h-3.5 text-amber-400" />
+                2D Semantic Visualizer
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowMap(false)}
+                className="p-1 rounded hover:bg-ink-800 text-ash hover:text-parchment transition-colors"
+                title="Close Map"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="flex-1 min-h-0 p-2">
+              <SemanticMapCanvas
+                chunks={allDocumentChunks}
+                activeSources={
+                  activeTurnSources.length > 0
+                    ? activeTurnSources
+                    : messages
+                        .slice()
+                        .reverse()
+                        .find((m) => m.role === 'assistant' && m.sources?.length)?.sources ?? []
+                }
+                highlightedChunkId={focusedChunkId}
+                onSelectChunk={(chunkId) => setFocusedChunkId(chunkId)}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Settings Modal */}
@@ -1059,35 +1595,97 @@ export default function DocuTalkPage() {
                 </label>
                 <select
                   value={provider}
-                  onChange={(e) => setProvider(e.target.value)}
+                  onChange={(e) => handleProviderChange(e.target.value as Provider)}
                   className="w-full px-3 py-2 bg-ink-800 border border-ink-700 rounded-lg text-sm text-parchment focus:outline-none focus:border-ember-500"
                 >
-                  <option value="groq">⚡ Groq — GPT-OSS 120B / Qwen (Recommended — Fast)</option>
-                  <option value="anthropic">Anthropic — Claude Sonnet</option>
-                  <option value="openai">OpenAI — GPT-4o-mini (Credits Required)</option>
+                  <option value="groq">
+                    ⚡ Groq {serverStatus ? (serverStatus.providers.groq?.serverKey === 'ok' ? '(server key ready)' : '(add your key)') : '(Recommended — Fast)'}
+                  </option>
+                  <option value="anthropic">
+                    Anthropic {serverStatus ? (serverStatus.providers.anthropic?.serverKey === 'ok' ? '(server key ready)' : '(add your key)') : '— Claude Sonnet'}
+                  </option>
+                  <option value="openai">
+                    OpenAI {serverStatus ? (serverStatus.providers.openai?.serverKey === 'ok' ? '(server key ready)' : '(add your key)') : '— GPT-4o-mini'}
+                  </option>
                 </select>
+                {providerHint && (
+                  <p className="text-[11px] text-ember-400 mt-1.5 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {providerHint}
+                  </p>
+                )}
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-ash mb-2">
-                  GENERATION API KEY{' '}
-                  <span className="text-ash/50 font-normal">
-                    (optional; only needed if overriding Supabase secrets)
-                  </span>
-                </label>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={
-                    provider === 'openai'
-                      ? 'sk-...'
-                      : provider === 'groq'
-                      ? 'gsk_...'
-                      : 'sk-ant-...'
-                  }
-                  className="w-full px-3 py-2 bg-ink-800 border border-ink-700 rounded-lg text-sm text-parchment placeholder-ash/50 focus:outline-none focus:border-ember-500 font-mono"
-                />
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-xs font-semibold text-ash">
+                    {provider.toUpperCase()} API KEY{' '}
+                    <span className="text-ash/50 font-normal">
+                      (optional; overrides server secret)
+                    </span>
+                  </label>
+                  {!isEditingKey && apiKeys[provider] && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingKey(true);
+                        setDraftKey('');
+                      }}
+                      className="text-[11px] text-ember-400 hover:text-ember-300 transition-colors"
+                    >
+                      Change key
+                    </button>
+                  )}
+                </div>
+
+                {!isEditingKey && apiKeys[provider] ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      readOnly
+                      value={maskKey(apiKeys[provider])}
+                      className="flex-1 px-3 py-2 bg-ink-900 border border-ink-700 rounded-lg text-sm text-parchment-300 font-mono select-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = { ...apiKeys, [provider]: '' };
+                        setApiKeys(next);
+                        setDraftKey('');
+                        setIsEditingKey(false);
+                      }}
+                      className="px-2.5 py-2 bg-ink-700 hover:bg-ink-600 text-ash hover:text-parchment rounded-lg text-xs transition-colors"
+                      title="Clear key"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                ) : (
+                  <input
+                    type="password"
+                    value={draftKey}
+                    onChange={(e) => handleKeyChange(e.target.value)}
+                    placeholder={
+                      provider === 'openai'
+                        ? 'sk-...'
+                        : provider === 'groq'
+                        ? 'gsk_...'
+                        : 'sk-ant-...'
+                    }
+                    className={`w-full px-3 py-2 bg-ink-800 border rounded-lg text-sm text-parchment placeholder-ash/50 focus:outline-none font-mono ${
+                      currentKeyError
+                        ? 'border-red-500 focus:border-red-500'
+                        : 'border-ink-700 focus:border-ember-500'
+                    }`}
+                  />
+                )}
+
+                {currentKeyError && (
+                  <p className="mt-1.5 text-xs text-red-400 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {currentKeyError}
+                  </p>
+                )}
               </div>
 
               {testResult && (
@@ -1111,17 +1709,17 @@ export default function DocuTalkPage() {
             <div className="flex gap-3 mt-6">
               <button
                 onClick={testConnection}
-                disabled={testing}
+                disabled={testing || !!currentKeyError}
                 className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-parchment text-xs font-medium rounded-lg transition-colors inline-flex items-center justify-center gap-1.5"
               >
                 {testing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
                 {testing ? 'Testing...' : 'Test Connection'}
               </button>
               <button
-                onClick={resetToEnvDefaults}
+                onClick={handleResetDefaults}
                 className="flex-1 py-2 bg-ink-800 hover:bg-ink-700 text-parchment-300 text-xs font-medium rounded-lg transition-colors"
               >
-                Clear local API key
+                Reset to Defaults
               </button>
             </div>
             <div className="flex gap-3 mt-2">
@@ -1132,8 +1730,9 @@ export default function DocuTalkPage() {
                 Discard
               </button>
               <button
-                onClick={() => saveApiKey(apiKey, provider)}
-                className="flex-1 py-2 bg-ember-600 hover:bg-ember-700 text-parchment text-xs font-medium rounded-lg transition-colors"
+                onClick={handleSaveSettings}
+                disabled={!!currentKeyError}
+                className="flex-1 py-2 bg-ember-600 hover:bg-ember-700 disabled:opacity-50 text-parchment text-xs font-medium rounded-lg transition-colors"
               >
                 Save Settings
               </button>

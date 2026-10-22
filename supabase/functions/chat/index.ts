@@ -1,11 +1,18 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { callGroq, type ChatMsg } from "../_shared/groq.ts";
+import { chatWithFallback, LlmUnavailableError, type ChatMsg } from "../_shared/llm.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
 
 interface Document {
   id: string;
@@ -14,94 +21,16 @@ interface Document {
   file_type: string;
 }
 
-async function callLLM(
-  system: string,
-  messages: ChatMsg[],
-  apiKey: string,
-  provider: string
-): Promise<string> {
-  if (provider === "groq") {
-    const key = apiKey || Deno.env.get("GROQ_API_KEY") || "";
-    const { text, model } = await callGroq({
-      apiKey: key,
-      system,
-      messages,
-    });
-    console.log(`[Chat] Groq answered with ${model}`);
-    return text;
-  }
-
-  if (provider === "anthropic") {
-    const key = apiKey || Deno.env.get("ANTHROPIC_API_KEY") || "";
-    if (!key) throw new Error("No API key for Anthropic");
-
-    const model = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-5-5";
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        system,
-        messages,
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
-
-    const json = await res.json();
-    return json.content?.[0]?.text ?? "";
-  }
-
-  if (provider === "openai") {
-    const key = apiKey || Deno.env.get("OPENAI_API_KEY") || "";
-    if (!key) throw new Error("No API key for OpenAI");
-
-    const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-4o-mini";
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        temperature: 0.3,
-        messages: [{ role: "system", content: system }, ...messages],
-      }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
-
-    const json = await res.json();
-    return json.choices?.[0]?.message?.content ?? "";
-  }
-
-  throw new Error(`Unsupported provider: ${provider}`);
-}
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
   try {
-    const { message, history, documents, apiKey, provider } = await req.json();
+    const { message, history, documents, apiKey, apiKeys, provider } = await req.json();
 
     if (!message) {
-      return new Response(
-        JSON.stringify({ error: "Message is required" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return jsonResponse({ error: "Message is required" }, 400);
     }
 
     // Build context from documents
@@ -130,34 +59,38 @@ ${contextText ? `\n\nRelevant documents have been provided in the context. Use t
 
 Be helpful, accurate, and concise. If you cannot find relevant information in the documents, clearly state that.`;
 
+    const HISTORY_LIMIT = 12;
+
     const chat: ChatMsg[] = [...(history || []), { role: "user", content: message }]
-      .filter((m: { role: string }) => m.role === "user" || m.role === "assistant")
-      .slice(-12);
+      .filter(
+        (m: { role: string; content?: string; isError?: boolean }) =>
+          (m.role === "user" || m.role === "assistant") &&
+          !m.isError &&
+          !(m.content || "").startsWith("AI connection failed")
+      )
+      .slice(-HISTORY_LIMIT);
     while (chat.length && chat[0].role !== "user") chat.shift();
 
-    const usedProvider = provider || "groq";
-    const responseText = await callLLM(systemPrompt, chat, apiKey, usedProvider);
+    const result = await chatWithFallback({
+      requested: provider,
+      system: systemPrompt,
+      messages: chat,
+      keys: { apiKey, apiKeys },
+    });
 
-    return new Response(
-      JSON.stringify({
-        response: responseText,
-        provider: usedProvider,
-        timestamp: new Date().toISOString(),
-      }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return jsonResponse({
+      response: result.text,
+      provider_used: result.provider,
+      model_used: result.model,
+      notice: result.notice,
+      timestamp: new Date().toISOString(),
+    });
   } catch (error) {
     console.error("Error:", error);
+    if (error instanceof LlmUnavailableError) {
+      return jsonResponse({ error: error.message }, 502);
+    }
     const message = error instanceof Error ? error.message : "Internal server error";
-    return new Response(
-      JSON.stringify({ error: message }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return jsonResponse({ error: message }, 500);
   }
 });

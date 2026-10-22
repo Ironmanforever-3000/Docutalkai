@@ -25,9 +25,9 @@ test('Vercel configuration serves the single-page app and no API routes', async 
 });
 
 test('server-side calls use the deployment environment', async () => {
-  const chatFunction = await readProjectFile('supabase/functions/chat/index.ts');
-  const ragFunction = await readProjectFile('supabase/functions/rag-chat/index.ts');
+  const llmModule = await readProjectFile('supabase/functions/_shared/llm.ts');
 
-  assert.match(chatFunction, /Deno\.env\.get\("OPENAI_API_KEY"\)/);
-  assert.match(ragFunction, /Deno\.env\.get\("OPENAI_API_KEY"\)/);
+  assert.match(llmModule, /OPENAI_API_KEY/);
+  assert.match(llmModule, /GROQ_API_KEY/);
 });
+
