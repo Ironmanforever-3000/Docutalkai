@@ -19,7 +19,7 @@ export default function Header({ user }: HeaderProps) {
   const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
-    if (user) {
+    if (user && user.app_metadata?.provider !== 'guest') {
       loadNotifications();
 
       const channel = supabase

@@ -51,6 +51,7 @@ export default function DocuTalkPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const docsParam = searchParams.get('docs');
+  const isGuestUser = user?.app_metadata?.provider === 'guest';
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   
@@ -139,7 +140,10 @@ export default function DocuTalkPage() {
   // Load 2D chunk coordinates for map visualization
   useEffect(() => {
     const loadChunksForMap = async () => {
-      if (!user) return;
+      if (!user || isGuestUser) {
+        setAllDocumentChunks([]);
+        return;
+      }
       try {
         let query = supabase
           .from('document_chunks')
@@ -358,13 +362,48 @@ export default function DocuTalkPage() {
 
   const loadSessions = async () => {
     if (!user) return;
+
+    // Instant local handling for guest mode
+    if (isGuestUser) {
+      let guestSessions: Array<{ id: string; title: string; created_at: string }> = [];
+      try {
+        const raw = localStorage.getItem('docutalk_guest_sessions');
+        if (raw) guestSessions = JSON.parse(raw);
+      } catch {}
+
+      if (guestSessions.length === 0) {
+        const defaultSession = {
+          id: 'guest-session-1',
+          title: 'New Chat',
+          created_at: new Date().toISOString(),
+        };
+        guestSessions = [defaultSession];
+        try {
+          localStorage.setItem('docutalk_guest_sessions', JSON.stringify(guestSessions));
+        } catch {}
+      }
+
+      setSessions(guestSessions);
+      if (!sessionId) {
+        navigate(`/app/chat/${guestSessions[0].id}`, { replace: true });
+      }
+      setLoadingHistory(false);
+      return;
+    }
+
     try {
-      const { data, error } = await supabase
+      const queryPromise = supabase
         .from('chat_sessions')
         .select('*')
         .eq('user_id', user.id)
         .order('updated_at', { ascending: false })
         .limit(10);
+
+      const timeoutPromise = new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('Session query timeout') }), 2500)
+      );
+
+      const { data, error } = await Promise.race([queryPromise, timeoutPromise]);
 
       if (error) throw error;
 
@@ -372,11 +411,17 @@ export default function DocuTalkPage() {
         setSessions(data);
         if (!sessionId) navigate(`/app/chat/${data[0].id}`, { replace: true });
       } else {
-        const { data: newSession, error: createError } = await supabase
+        const insertPromise = supabase
           .from('chat_sessions')
           .insert({ user_id: user.id, title: 'New Chat' })
           .select()
           .single();
+
+        const insertTimeout = new Promise<{ data: null; error: Error }>((resolve) =>
+          setTimeout(() => resolve({ data: null, error: new Error('Insert timeout') }), 2500)
+        );
+
+        const { data: newSession, error: createError } = await Promise.race([insertPromise, insertTimeout]);
 
         if (createError) throw createError;
         if (newSession) {
@@ -385,45 +430,94 @@ export default function DocuTalkPage() {
         }
       }
     } catch (err) {
-      console.error('Error loading sessions:', err);
+      console.warn('Notice loading sessions from cloud (offline/timeout fallback):', err);
+      const fallbackSession = {
+        id: `local-${Date.now()}`,
+        title: 'New Chat',
+        created_at: new Date().toISOString(),
+      };
+      setSessions([fallbackSession]);
+      if (!sessionId) navigate(`/app/chat/${fallbackSession.id}`, { replace: true });
     } finally {
       setLoadingHistory(false);
     }
   };
 
-  const loadMessages = async (sessionId: string) => {
+  const loadMessages = async (currentSessionId: string) => {
     if (!user) return;
+
+    if (isGuestUser || currentSessionId.startsWith('guest-') || currentSessionId.startsWith('local-')) {
+      try {
+        const raw = localStorage.getItem(`docutalk_guest_msgs_${currentSessionId}`);
+        if (raw) {
+          setMessages(JSON.parse(raw));
+        } else {
+          setMessages([]);
+        }
+      } catch {
+        setMessages([]);
+      }
+      setLoadingHistory(false);
+      return;
+    }
+
     try {
-      const { data, error } = await supabase
+      const queryPromise = supabase
         .from('chat_messages')
         .select('*')
         .eq('user_id', user.id)
-        .eq('session_id', sessionId)
+        .eq('session_id', currentSessionId)
         .order('created_at', { ascending: true });
 
+      const timeoutPromise = new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('Messages query timeout') }), 2500)
+      );
+
+      const { data, error } = await Promise.race([queryPromise, timeoutPromise]);
       if (error) throw error;
       const cleanMessages = (data || []).filter(
         (m: ChatMessage) => !m.content.startsWith('AI connection failed')
       );
       setMessages(cleanMessages);
     } catch (err) {
-      console.error('Error loading messages:', err);
+      console.warn('Notice loading messages from cloud:', err);
+      setMessages([]);
+    } finally {
+      setLoadingHistory(false);
     }
   };
 
   const loadDocuments = async (): Promise<Document[]> => {
     if (!user) return [];
+
+    if (isGuestUser) {
+      try {
+        const raw = localStorage.getItem('docutalk_guest_docs');
+        const docs = raw ? (JSON.parse(raw) as Document[]) : [];
+        setSelectedDocIds(new Set(docs.map((d) => d.id)));
+        return docs;
+      } catch {
+        return [];
+      }
+    }
+
     try {
-      const { data, error } = await supabase
+      const queryPromise = supabase
         .from('documents')
         .select('id, name, file_type, status, char_count, created_at, error_message')
         .eq('user_id', user.id)
         .eq('status', 'ready')
         .order('created_at', { ascending: false })
         .limit(50);
+
+      const timeoutPromise = new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('Documents timeout') }), 2500)
+      );
+
+      const { data, error } = await Promise.race([queryPromise, timeoutPromise]);
       
       if (error) {
-        console.error('Error fetching documents:', error);
+        console.warn('Documents query note:', error.message);
       }
 
       const docs = (data as Document[]) || [];
@@ -435,23 +529,28 @@ export default function DocuTalkPage() {
       }
       return docs;
     } catch (err) {
-      console.error('Error loading documents:', err);
+      console.warn('Error loading documents:', err);
       return [];
     }
   };
 
-  const loadDataSources = async () => {
-    if (!user) return [];
+  const loadDataSources = async (): Promise<DataSource[]> => {
+    if (!user || isGuestUser) return [];
     try {
-      const { data } = await supabase
+      const queryPromise = supabase
         .from('data_sources')
         .select('*')
         .eq('user_id', user.id)
         .order('created_at', { ascending: false });
 
+      const timeoutPromise = new Promise<{ data: null }>((resolve) =>
+        setTimeout(() => resolve({ data: null }), 2500)
+      );
+
+      const { data } = await Promise.race([queryPromise, timeoutPromise]);
       return (data as DataSource[]) || [];
     } catch (err) {
-      console.error('Error loading data sources:', err);
+      console.warn('Error loading data sources:', err);
       return [];
     }
   };
@@ -462,6 +561,15 @@ export default function DocuTalkPage() {
     setIsLoadingDocs(true);
     setSyncNotice(null);
 
+    if (isGuestUser) {
+      const docs = await loadDocuments();
+      setDocuments(docs);
+      setDataSources([]);
+      setIsLoadingDocs(false);
+      setIsSyncingSources(false);
+      return;
+    }
+
     try {
       const [sources, loadedDocs] = await Promise.all([
         loadDataSources(),
@@ -470,7 +578,7 @@ export default function DocuTalkPage() {
       setDataSources(sources);
       setDocuments(loadedDocs);
     } catch (err) {
-      console.error('Error initializing RAG context:', err);
+      console.warn('Error initializing RAG context:', err);
     } finally {
       setIsSyncingSources(false);
       setIsLoadingDocs(false);
@@ -527,6 +635,29 @@ export default function DocuTalkPage() {
           return;
         }
         const text = result.text;
+
+        if (isGuestUser) {
+          const guestDoc: Document = {
+            id: `guest-doc-${Date.now()}`,
+            user_id: user.id,
+            name: file.name,
+            file_type: file.name.split('.').pop() || 'txt',
+            status: 'ready',
+            extracted_text: text,
+            char_count: text.length,
+            content_text: text,
+            created_at: new Date().toISOString(),
+          };
+          const updated = [guestDoc, ...documents];
+          setDocuments(updated);
+          setSelectedDocIds((prev) => new Set([...prev, guestDoc.id]));
+          setAttachedFileName(file.name);
+          try {
+            localStorage.setItem('docutalk_guest_docs', JSON.stringify(updated));
+          } catch {}
+          setIsParsingFile(false);
+          return;
+        }
 
         const { data, error } = await supabase
           .from('documents')
@@ -604,6 +735,32 @@ export default function DocuTalkPage() {
     setIsSavingPaste(true);
     setPasteError(null);
     const documentTitle = pasteTitle.trim() || `Pasted Doc - ${new Date().toLocaleDateString()}`;
+
+    if (isGuestUser) {
+      const trimmed = pastedText.trim();
+      const guestDoc: Document = {
+        id: `guest-doc-${Date.now()}`,
+        user_id: user.id,
+        name: documentTitle,
+        file_type: 'txt',
+        status: 'ready',
+        extracted_text: trimmed,
+        content_text: trimmed,
+        char_count: trimmed.length,
+        created_at: new Date().toISOString(),
+      };
+      const updated = [guestDoc, ...documents];
+      setDocuments(updated);
+      setSelectedDocIds((prev) => new Set([...prev, guestDoc.id]));
+      try {
+        localStorage.setItem('docutalk_guest_docs', JSON.stringify(updated));
+      } catch {}
+      setPastedText('');
+      setPasteTitle('');
+      setShowPasteArea(false);
+      setIsSavingPaste(false);
+      return;
+    }
 
     try {
       const trimmed = pastedText.trim();
@@ -738,21 +895,37 @@ export default function DocuTalkPage() {
     let usedModel: string | undefined;
 
     try {
-      // Save user message to database
-      await supabase.from('chat_messages').insert({
-        id: userMsgId,
-        user_id: user.id,
-        session_id: sessionId,
-        role: 'user',
-        content: userMessage,
-      });
+      // Record user message to DB if not guest, or to localStorage if guest
+      if (!isGuestUser) {
+        try {
+          await supabase.from('chat_messages').insert({
+            id: userMsgId,
+            user_id: user.id,
+            session_id: sessionId,
+            role: 'user',
+            content: userMessage,
+          });
+        } catch (err) {
+          console.warn('Message cloud save note:', err);
+        }
+      } else {
+        try {
+          const current = JSON.parse(localStorage.getItem(`docutalk_guest_msgs_${sessionId}`) || '[]');
+          localStorage.setItem(
+            `docutalk_guest_msgs_${sessionId}`,
+            JSON.stringify([...current, userChatMessage])
+          );
+        } catch {}
+      }
 
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-
-      if (!session?.access_token) {
-        throw new Error('Your session has expired. Please sign in again.');
+      let authToken = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      if (!isGuestUser) {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session?.access_token) {
+            authToken = session.access_token;
+          }
+        } catch {}
       }
 
       const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/rag-chat`;
@@ -765,7 +938,7 @@ export default function DocuTalkPage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session.access_token}`,
+          Authorization: `Bearer ${authToken}`,
           apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
         },
         body: JSON.stringify({
@@ -988,6 +1161,15 @@ export default function DocuTalkPage() {
 
   const clearChat = async () => {
     if (!user || !sessionId || !confirm('Clear this chat session?')) return;
+
+    if (isGuestUser || sessionId.startsWith('guest-') || sessionId.startsWith('local-')) {
+      try {
+        localStorage.removeItem(`docutalk_guest_msgs_${sessionId}`);
+      } catch {}
+      setMessages([]);
+      return;
+    }
+
     try {
       await supabase.from('chat_messages').delete().eq('session_id', sessionId);
       setMessages([]);
@@ -998,6 +1180,22 @@ export default function DocuTalkPage() {
 
   const createNewSession = async () => {
     if (!user) return;
+
+    if (isGuestUser) {
+      const newSession = {
+        id: `guest-session-${Date.now()}`,
+        title: 'New Chat',
+        created_at: new Date().toISOString(),
+      };
+      const updated = [newSession, ...sessions];
+      setSessions(updated);
+      try {
+        localStorage.setItem('docutalk_guest_sessions', JSON.stringify(updated));
+      } catch {}
+      navigate(`/app/chat/${newSession.id}`);
+      return;
+    }
+
     try {
       const { data: newSession, error: createError } = await supabase
         .from('chat_sessions')
@@ -1011,7 +1209,14 @@ export default function DocuTalkPage() {
         navigate(`/app/chat/${newSession.id}`);
       }
     } catch (err) {
-      console.error('Error creating new session:', err);
+      console.warn('Error creating new session in cloud, using local fallback:', err);
+      const fallbackSession = {
+        id: `local-${Date.now()}`,
+        title: 'New Chat',
+        created_at: new Date().toISOString(),
+      };
+      setSessions([fallbackSession, ...sessions]);
+      navigate(`/app/chat/${fallbackSession.id}`);
     }
   };
 
