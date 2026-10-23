@@ -59,11 +59,10 @@ export default function DocuTalkPage() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [dataSources, setDataSources] = useState<DataSource[]>([]);
   const [isSyncingSources, setIsSyncingSources] = useState(false);
-  const [isLoadingDocs, setIsLoadingDocs] = useState(true);
+  const [isLoadingDocs, setIsLoadingDocs] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [loadingHistory, setLoadingHistory] = useState(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
 
@@ -387,7 +386,6 @@ export default function DocuTalkPage() {
       if (!sessionId) {
         navigate(`/app/chat/${guestSessions[0].id}`, { replace: true });
       }
-      setLoadingHistory(false);
       return;
     }
 
@@ -439,7 +437,6 @@ export default function DocuTalkPage() {
       setSessions([fallbackSession]);
       if (!sessionId) navigate(`/app/chat/${fallbackSession.id}`, { replace: true });
     } finally {
-      setLoadingHistory(false);
     }
   };
 
@@ -457,7 +454,6 @@ export default function DocuTalkPage() {
       } catch {
         setMessages([]);
       }
-      setLoadingHistory(false);
       return;
     }
 
@@ -483,7 +479,6 @@ export default function DocuTalkPage() {
       console.warn('Notice loading messages from cloud:', err);
       setMessages([]);
     } finally {
-      setLoadingHistory(false);
     }
   };
 
@@ -845,7 +840,18 @@ export default function DocuTalkPage() {
   };
 
   const handleSend = async () => {
-    if (!input.trim() || loading || isStreaming || !user || !sessionId) return;
+    if (!input.trim() || loading || isStreaming || !user) return;
+
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      if (sessions.length > 0) {
+        activeSessionId = sessions[0].id;
+      } else {
+        activeSessionId = isGuestUser ? `guest-session-${Date.now()}` : `session-${Date.now()}`;
+        setSessions([{ id: activeSessionId, title: 'New Chat', created_at: new Date().toISOString() }]);
+      }
+      navigate(`/app/chat/${activeSessionId}`, { replace: true });
+    }
 
     const userMessage = input.trim();
     setInput('');
@@ -858,7 +864,7 @@ export default function DocuTalkPage() {
     const userChatMessage: ChatMessage = {
       id: userMsgId,
       user_id: user.id,
-      session_id: sessionId,
+      session_id: activeSessionId,
       role: 'user',
       content: userMessage,
       created_at: new Date().toISOString(),
@@ -867,7 +873,7 @@ export default function DocuTalkPage() {
     const assistantPlaceholder: ChatMessage = {
       id: assistantMsgId,
       user_id: user.id,
-      session_id: sessionId,
+      session_id: activeSessionId,
       role: 'assistant',
       content: '',
       created_at: new Date().toISOString(),
@@ -901,7 +907,7 @@ export default function DocuTalkPage() {
           await supabase.from('chat_messages').insert({
             id: userMsgId,
             user_id: user.id,
-            session_id: sessionId,
+            session_id: activeSessionId,
             role: 'user',
             content: userMessage,
           });
@@ -910,9 +916,9 @@ export default function DocuTalkPage() {
         }
       } else {
         try {
-          const current = JSON.parse(localStorage.getItem(`docutalk_guest_msgs_${sessionId}`) || '[]');
+          const current = JSON.parse(localStorage.getItem(`docutalk_guest_msgs_${activeSessionId}`) || '[]');
           localStorage.setItem(
-            `docutalk_guest_msgs_${sessionId}`,
+            `docutalk_guest_msgs_${activeSessionId}`,
             JSON.stringify([...current, userChatMessage])
           );
         } catch {}
@@ -1076,13 +1082,39 @@ export default function DocuTalkPage() {
       );
 
       if (finalText.trim()) {
-        await supabase.from('chat_messages').insert({
-          id: assistantMsgId,
-          user_id: user.id,
-          session_id: sessionId,
-          role: 'assistant',
-          content: finalText,
-        });
+        if (!isGuestUser) {
+          try {
+            await supabase.from('chat_messages').insert({
+              id: assistantMsgId,
+              user_id: user.id,
+              session_id: activeSessionId,
+              role: 'assistant',
+              content: finalText,
+            });
+          } catch (cloudErr) {
+            console.warn('Assistant message cloud save note:', cloudErr);
+          }
+        } else {
+          try {
+            const current = JSON.parse(localStorage.getItem(`docutalk_guest_msgs_${activeSessionId}`) || '[]');
+            localStorage.setItem(
+              `docutalk_guest_msgs_${activeSessionId}`,
+              JSON.stringify([
+                ...current,
+                {
+                  id: assistantMsgId,
+                  role: 'assistant',
+                  content: finalText,
+                  sources: streamedSources,
+                  provider_used: usedProvider,
+                  model_used: usedModel,
+                  status: 'done',
+                  isStreaming: false,
+                },
+              ])
+            );
+          } catch {}
+        }
       }
     } catch (err: unknown) {
       if (rafId) {
@@ -1256,13 +1288,18 @@ export default function DocuTalkPage() {
           <h1 className="font-display text-2xl font-semibold text-parchment">DocuTalk AI</h1>
           <div className="flex items-center gap-2 mt-1">
             <p className="text-xs text-ash">
-              {isLoadingDocs
-                ? 'Loading documents...'
-                : selectedDocIds.size > 0
-                ? `${selectedDocIds.size} of ${documents.length} document${documents.length !== 1 ? 's' : ''} active`
-                : documents.length > 0
-                ? '0 documents selected — answers will not use document context'
-                : 'No documents loaded — upload, paste, or sync a data source.'}
+              {isLoadingDocs ? (
+                <span className="inline-flex items-center gap-1.5 text-ash">
+                  <Loader2 className="w-3 h-3 animate-spin text-ember-400" />
+                  Updating documents...
+                </span>
+              ) : selectedDocIds.size > 0 ? (
+                `${selectedDocIds.size} of ${documents.length} document${documents.length !== 1 ? 's' : ''} active for RAG`
+              ) : documents.length > 0 ? (
+                `${documents.length} document${documents.length !== 1 ? 's' : ''} available · Select to query`
+              ) : (
+                'Ready to chat · Ask any question or attach files for document context'
+              )}
             </p>
             {dataSources.filter((s) => s.sync_status === 'synced').length > 0 && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-purple-500/15 border border-purple-500/30 text-purple-400 text-[10px] font-semibold rounded-full">
@@ -1351,11 +1388,7 @@ export default function DocuTalkPage() {
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden min-h-0">
         <div className="flex-1 flex flex-col overflow-hidden min-h-0">
       {/* Chat messages area */}
-      {loadingHistory ? (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-ember-500" />
-        </div>
-      ) : messages.length === 0 ? (
+      {messages.length === 0 ? (
         <div className="flex-1 flex items-center justify-center p-8 overflow-y-auto">
           <div className="text-center max-w-xl w-full space-y-6">
             <div className="bg-ink-800 border border-ink-700 rounded-2xl p-6 text-left">
@@ -1663,10 +1696,8 @@ export default function DocuTalkPage() {
               onPaste={handleTextareaPaste}
               placeholder={
                 isDraggingOver
-                  ? '📎 Drop your document here…'
-                  : documents.length === 0
-                  ? '⚠️ Load documents first — or attach a file with 📎'
-                  : 'Ask questions about your documents… or paste / drop a file here'
+                  ? '📎 Drop your document here to attach…'
+                  : 'Ask anything, chat with your data, or drop/paste a document…'
               }
               rows={1}
               className="flex-1 px-4 py-3 bg-ink-700 border border-ink-700 rounded-xl text-sm text-parchment placeholder-ash/60 focus:outline-none focus:border-ember-500 transition-colors resize-none"
