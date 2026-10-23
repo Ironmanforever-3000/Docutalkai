@@ -899,6 +899,7 @@ export default function DocuTalkPage() {
     let streamedSources: SourceCitation[] = [];
     let usedProvider: Provider = provider;
     let usedModel: string | undefined;
+    const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/rag-chat`;
 
     try {
       // Record user message to DB if not guest, or to localStorage if guest
@@ -934,7 +935,6 @@ export default function DocuTalkPage() {
         } catch {}
       }
 
-      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/rag-chat`;
 
       const activeDocIds = documents
         .filter((d) => selectedDocIds.has(d.id))
@@ -961,7 +961,14 @@ export default function DocuTalkPage() {
 
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.error || `Server error (${response.status})`);
+        let detailedMsg = errJson.error || `Server error (${response.status})`;
+        if (response.status === 401) {
+          detailedMsg = 'Authentication failed (401 Unauthorized): Your session token or anon key was not accepted by the Edge Function.';
+        } else if (response.status === 502) {
+          detailedMsg = `AI Provider unavailable (502 Bad Gateway): ${errJson.error || 'All configured LLM providers failed.'}`;
+        }
+        const httpError = Object.assign(new Error(detailedMsg), { status: response.status });
+        throw httpError;
       }
 
       const reader = response.body?.getReader();
@@ -1153,8 +1160,21 @@ export default function DocuTalkPage() {
         return;
       }
 
-      const errorMessage =
-        err instanceof Error ? err.message : 'AI connection failed';
+      let errorMessage = 'AI connection failed';
+      let guidance = 'If this keeps happening, check your AI settings or the Edge Function logs.';
+
+      if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('network') || err.message.includes('Failed'))) {
+        errorMessage = `Network / DNS failure: Unable to reach ${functionUrl}.`;
+        guidance = 'The request never reached Supabase. Check your internet connection, verify VITE_SUPABASE_URL points to an active project, and ensure CORS is enabled for this origin.';
+      } else if (err instanceof Error) {
+        errorMessage = err.message;
+        const errStatus = typeof err === 'object' && err !== null && 'status' in err ? (err as { status?: number }).status : undefined;
+        if (errStatus === 401) {
+          guidance = 'Please sign in or check your Supabase anon key.';
+        } else if (errStatus === 502) {
+          guidance = 'Check your AI API keys (Groq, OpenAI, or Anthropic) in AI Settings.';
+        }
+      }
       console.error('Streaming error:', err);
 
       setChatError(errorMessage);
@@ -1163,7 +1183,7 @@ export default function DocuTalkPage() {
           m.id === assistantMsgId
             ? {
                 ...m,
-                content: `AI connection failed: ${errorMessage}. If this keeps happening, check your AI settings or the Edge Function logs.`,
+                content: `${errorMessage} ${guidance}`,
                 status: 'error',
                 isStreaming: false,
                 isError: true,

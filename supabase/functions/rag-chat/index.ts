@@ -45,10 +45,11 @@ Deno.serve(async (req: Request) => {
       { global: { headers: { Authorization: authHeader } } }
     );
 
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim();
     const {
       data: { user },
       error: authErr,
-    } = await supabase.auth.getUser();
+    } = await supabase.auth.getUser(token);
 
     if (authErr || !user) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
