@@ -35,10 +35,25 @@ function Shell() {
 
 function AppContent() {
   const { user, loading: authLoading } = useAuth();
-  const [preloaderDone, setPreloaderDone] = useState(false);
+  const [preloaderDone, setPreloaderDone] = useState(() => {
+    if (typeof window !== 'undefined') {
+      // Skip 3.7s preloader on /login so login is instant
+      if (window.location.pathname === '/login') return true;
+      // Skip if already seen in current browser session
+      if (sessionStorage.getItem('docutalk_preloader_seen') === '1') return true;
+    }
+    return false;
+  });
+
+  const handlePreloaderComplete = () => {
+    if (typeof window !== 'undefined') {
+      sessionStorage.setItem('docutalk_preloader_seen', '1');
+    }
+    setPreloaderDone(true);
+  };
 
   if (!preloaderDone) {
-    return <Preloader onComplete={() => setPreloaderDone(true)} />;
+    return <Preloader onComplete={handlePreloaderComplete} />;
   }
 
   if (authLoading) {
