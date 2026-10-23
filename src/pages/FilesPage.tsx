@@ -37,7 +37,7 @@ export default function FilesPage() {
       const [filesRes, projectsRes] = await Promise.all([
         supabase
           .from('documents')
-          .select('*')
+          .select('id, name, file_type, file_size, char_count, status, error_message, storage_path, project_id, created_at, updated_at')
           .eq('user_id', user.id)
           .order('created_at', { ascending: false }),
         supabase
@@ -334,7 +334,15 @@ export default function FilesPage() {
   };
 
   const handlePreview = async (file: Document) => {
-    const text = file.extracted_text || file.content_text;
+    let text = file.extracted_text || file.content_text;
+    if (!text) {
+      const { data } = await supabase
+        .from('documents')
+        .select('content_text, extracted_text')
+        .eq('id', file.id)
+        .maybeSingle();
+      text = data?.extracted_text || data?.content_text;
+    }
     if (!text) {
       setError(`No extracted text available for "${file.name}"`);
       return;

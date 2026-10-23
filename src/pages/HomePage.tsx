@@ -88,10 +88,10 @@ export default function HomePage({ onNavigate }: HomePageProps) {
       };
       setStats(newStats);
 
-      // Load recent documents
+      // Load recent documents (metadata only)
       const { data: recentDocs } = await supabase
         .from('documents')
-        .select('*')
+        .select('id, name, file_type, status, created_at')
         .eq('user_id', user.id)
         .order('created_at', { ascending: false })
         .limit(5);

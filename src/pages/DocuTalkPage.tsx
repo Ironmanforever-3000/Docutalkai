@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { Send, Bot, User, Trash2, Copy, Check, FileText, Settings, AlertCircle, Paperclip, X, Loader2, Download, Zap, Database, MessageSquarePlus, Square, Compass } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
-import { supabase, syncDataSource, functionErrorMessage } from '../lib/supabase';
+import { supabase, functionErrorMessage } from '../lib/supabase';
 import { Document, ChatMessage, DataSource, Provider, SourceCitation } from '../types';
 import { extractTextFromFile } from '../lib/extraction';
 
@@ -416,7 +416,7 @@ export default function DocuTalkPage() {
     try {
       const { data, error } = await supabase
         .from('documents')
-        .select('id, name, file_type, content_text, extracted_text, status, char_count, error_message')
+        .select('id, name, file_type, status, char_count, created_at, error_message')
         .eq('user_id', user.id)
         .eq('status', 'ready')
         .order('created_at', { ascending: false })
@@ -459,42 +459,21 @@ export default function DocuTalkPage() {
   const initializeRagContext = async () => {
     if (!user) return;
 
-    setIsSyncingSources(true);
     setIsLoadingDocs(true);
     setSyncNotice(null);
 
     try {
-      const sources = await loadDataSources();
+      const [sources, loadedDocs] = await Promise.all([
+        loadDataSources(),
+        loadDocuments(),
+      ]);
       setDataSources(sources);
-
-      const postgresSources = sources.filter((s) => s.type === 'postgres');
-      const needsSync = postgresSources.filter(
-        (s) => s.sync_status !== 'synced' && s.sync_status !== 'syncing'
-      );
-
-      if (needsSync.length > 0) {
-        setSyncNotice(`Syncing ${needsSync.length} data source(s) to DocuTalk AI...`);
-        for (const source of needsSync) {
-          try {
-            await syncDataSource(source.id);
-          } catch (syncErr) {
-            console.warn(`Failed to sync data source ${source.name}:`, syncErr);
-          }
-        }
-      }
-
-      const loadedDocs = await loadDocuments();
       setDocuments(loadedDocs);
-
-      const refreshedSources = await loadDataSources();
-      setDataSources(refreshedSources);
     } catch (err) {
       console.error('Error initializing RAG context:', err);
-      setSyncNotice('Could not sync data sources. Use Data Sources → Sync to DocuTalk AI.');
     } finally {
       setIsSyncingSources(false);
       setIsLoadingDocs(false);
-      setTimeout(() => setSyncNotice(null), 5000);
     }
   };
 
