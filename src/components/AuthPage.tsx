@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import Logo from './Logo';
+import { Compass } from 'lucide-react';
 
 export default function AuthPage() {
   const [isLogin, setIsLogin] = useState(true);
@@ -9,7 +10,8 @@ export default function AuthPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
-  const { signIn, signUp, signInWithGoogle } = useAuth();
+  const { signIn, signUp, signInWithGoogle, signInAsGuest } = useAuth();
+  const [guestLoading, setGuestLoading] = useState(false);
 
   useEffect(() => {
     const searchParams = new URLSearchParams(window.location.search);
@@ -42,6 +44,18 @@ export default function AuthPage() {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGuestSignIn = async () => {
+    setError(null);
+    setGuestLoading(true);
+    try {
+      await signInAsGuest();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to continue as guest');
+    } finally {
+      setGuestLoading(false);
     }
   };
 
@@ -103,6 +117,17 @@ export default function AuthPage() {
               <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
             </svg>
             {googleLoading ? 'Redirecting to Google...' : 'Continue with Google'}
+          </button>
+
+          {/* Continue as Guest option */}
+          <button
+            type="button"
+            onClick={handleGuestSignIn}
+            disabled={guestLoading || googleLoading}
+            className="w-full flex items-center justify-center gap-2.5 py-3 px-4 bg-ink-900/90 hover:bg-ink-700/80 text-parchment border border-ink-600/80 rounded-lg font-medium transition-all duration-200 mb-6 group cursor-pointer"
+          >
+            <Compass className="w-5 h-5 text-ember-400 group-hover:rotate-45 transition-transform" />
+            <span>{guestLoading ? 'Entering as Guest...' : 'Continue as Guest'}</span>
           </button>
 
           {/* Divider */}

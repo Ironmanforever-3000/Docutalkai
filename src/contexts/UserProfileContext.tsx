@@ -65,7 +65,17 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
         setProfile(newProfile);
       }
     } catch (error) {
-      console.error('Error loading profile:', error);
+      console.warn('Profile load fallback for guest/offline user:', error);
+      if (!profile) {
+        setProfile({
+          id: user.id,
+          user_id: user.id,
+          display_name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Guest Explorer',
+          theme: 'dark',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        } as UserProfile);
+      }
     } finally {
       setLoading(false);
     }
