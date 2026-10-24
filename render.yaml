@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: docutalk-ai
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_SUPABASE_URL
+        value: https://dristvsoinnvufgndymj.supabase.co
+      - key: VITE_SUPABASE_ANON_KEY
+        value: sb_publishable_YZYBRQQL5OyDWfm_am7UwA_QJMrkTN2
