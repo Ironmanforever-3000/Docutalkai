@@ -899,7 +899,9 @@ export default function DocuTalkPage() {
     let streamedSources: SourceCitation[] = [];
     let usedProvider: Provider = provider;
     let usedModel: string | undefined;
-    const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/rag-chat`;
+    const supabaseBaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://dristvsoinnvufgndymj.supabase.co';
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_YZYBRQQL5OyDWfm_am7UwA_QJMrkTN2';
+    const functionUrl = `${supabaseBaseUrl}/functions/v1/rag-chat`;
 
     try {
       // Record user message to DB if not guest, or to localStorage if guest
@@ -925,7 +927,7 @@ export default function DocuTalkPage() {
         } catch {}
       }
 
-      let authToken = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      let authToken = supabaseAnonKey;
       if (!isGuestUser) {
         try {
           const { data: { session } } = await supabase.auth.getSession();
@@ -945,7 +947,7 @@ export default function DocuTalkPage() {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${authToken}`,
-          apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+          apikey: supabaseAnonKey,
         },
         body: JSON.stringify({
           message: userMessage,
